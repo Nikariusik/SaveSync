@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 
-from server import create_app
+from server import CreateRoomRequest, create_app
 
 
 def archive_bytes(content: str) -> bytes:
@@ -20,6 +20,43 @@ def archive_bytes(content: str) -> bytes:
 
 
 class SaveRetentionTests(unittest.TestCase):
+    def test_room_creation_supports_legacy_password_schema(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connection = sqlite3.connect(root / "saves.sqlite3")
+            try:
+                connection.execute(
+                    "CREATE TABLE rooms ("
+                    "code TEXT PRIMARY KEY, name TEXT NOT NULL, "
+                    "password_salt BLOB NOT NULL, password_hash BLOB NOT NULL, "
+                    "created_at TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO rooms VALUES (?, ?, ?, ?, ?)",
+                    ("ABCDEFGH", "Old room", b"salt", b"hash", "old"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            app = create_app(root)
+            create_room = next(
+                route.endpoint
+                for route in app.routes
+                if getattr(route, "path", None) == "/api/rooms"
+            )
+            result = create_room(CreateRoomRequest(name="New room"))
+
+            self.assertEqual(len(result["code"]), 24)
+            connection = sqlite3.connect(root / "saves.sqlite3")
+            try:
+                room_count = connection.execute(
+                    "SELECT COUNT(*) FROM rooms"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(room_count, 2)
+
     def test_host_can_disable_client_uploads(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = create_app(Path(temporary), allow_uploads=False)
@@ -50,7 +87,7 @@ class SaveRetentionTests(unittest.TestCase):
     def test_limit_keeps_newest_archives_per_player_and_game(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app = create_app(root, room_tokens={"test-room": "test-password"})
+            app = create_app(root)
             upload = next(
                 route.endpoint
                 for route in app.routes
@@ -104,7 +141,7 @@ class SaveRetentionTests(unittest.TestCase):
     def test_upload_without_limit_preserves_legacy_behavior(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            app = create_app(root, room_tokens={"test-room": "test-password"})
+            app = create_app(root)
             upload = next(
                 route.endpoint
                 for route in app.routes

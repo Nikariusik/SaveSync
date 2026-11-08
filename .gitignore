@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+dist-compact/
 data/
 test-server/
 .vscode/

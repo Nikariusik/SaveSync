@@ -7,8 +7,7 @@ hidden_imports = (
     collect_submodules("watchdog.observers")
     + collect_submodules("uvicorn")
     + collect_submodules("multipart")
-    + collect_submodules("cryptography")
-    + ["server", "host_network"]
+    + ["server"]
 )
 
 a = Analysis(

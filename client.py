@@ -1,4 +1,3 @@
-import base64
 import ipaddress
 import importlib
 import http.client
@@ -8,7 +7,6 @@ import re
 import shutil
 import socket
 import stat
-import ssl
 import sys
 import tempfile
 import threading
@@ -21,21 +19,13 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
+from typing import Callable
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import psutil
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
-
-from host_network import (
-    PortMapping,
-    add_upnp_port_mapping,
-    create_host_certificate,
-    make_pinned_ssl_context,
-    verify_peer_fingerprint,
-)
-
 
 MAX_EXTRACTED_BYTES = 10 * 1024**3
 MAX_ARCHIVE_ENTRIES = 100_000
@@ -50,26 +40,13 @@ DEFAULT_MAX_SAVES_PER_GAME = 10
 MIN_MAX_SAVES_PER_GAME = 1
 MAX_MAX_SAVES_PER_GAME = 100
 DEFAULT_HOST_PORT = 8765
-DEFAULT_HOST_CONNECTION_METHOD = "porthole"
 LOCAL_SAVE_SYNC_INTERVAL_MS = 30_000
-HOST_CONNECTION_METHODS = {
-    "upnp": "UPnP",
-    "radmin": "Radmin VPN",
-    "porthole": "Porthole",
-}
+MINECRAFT_WORLD_PREFIX = "Minecraft — "
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
 }
-
-
-def normalize_host_connection_method(method: object) -> str:
-    if method == "portholl":
-        return "porthole"
-    if isinstance(method, str) and method in HOST_CONNECTION_METHODS:
-        return method
-    return DEFAULT_HOST_CONNECTION_METHOD
 
 
 @dataclass(frozen=True)
@@ -118,45 +95,17 @@ def auto_upload_delay(
     return max(0, last_upload_at + interval_minutes * 60 - now)
 
 
-def host_connection_url(address: str, port: int) -> str:
+def local_server_url(address: str, port: int) -> str:
     host = address.strip()
-    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
-        raise ValueError("Введите публичный IPv4 или DNS-адрес без схемы и порта.")
-    if host.startswith(".") or host.endswith(".") or ".." in host:
-        raise ValueError("Адрес для друзей введён некорректно.")
     try:
-        ipaddress.IPv4Address(host)
-    except ipaddress.AddressValueError:
-        if any(not label or len(label) > 63 for label in host.split(".")):
-            raise ValueError("DNS-имя для друзей введено некорректно.")
+        address_value = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("Не удалось определить IPv4-адрес этого компьютера.") from exc
     if not 1 <= port <= 65535:
         raise ValueError("Порт должен быть от 1 до 65535.")
-    return f"https://{host}:{port}"
-
-
-def host_vpn_connection_url(address: str, port: int) -> str:
-    try:
-        vpn_address = ipaddress.IPv4Address(address.strip())
-    except ipaddress.AddressValueError as exc:
-        raise ValueError("Укажите IPv4-адрес этого ПК в VPN-сети.") from exc
-    if vpn_address.is_loopback or vpn_address.is_unspecified:
-        raise ValueError("Укажите IPv4-адрес этого ПК в VPN-сети, не localhost.")
-    return host_connection_url(str(vpn_address), port)
-
-
-def local_ipv4_addresses() -> list[str]:
-    addresses = set()
-    for interface_addresses in psutil.net_if_addrs().values():
-        for address in interface_addresses:
-            if address.family != socket.AF_INET:
-                continue
-            try:
-                parsed_address = ipaddress.IPv4Address(address.address)
-            except ipaddress.AddressValueError:
-                continue
-            if not parsed_address.is_loopback and not parsed_address.is_unspecified:
-                addresses.add(parsed_address)
-    return [str(address) for address in sorted(addresses)]
+    if address_value.is_unspecified or address_value.is_loopback:
+        raise ValueError("Укажите доступный в локальной сети IPv4-адрес.")
+    return f"http://{address_value}:{port}"
 
 
 def safe_game_folder_name(game: str) -> str:
@@ -201,9 +150,6 @@ class EmbeddedHostServer:
         self.storage_root = storage_root.resolve()
         self.port = port
         self.allow_uploads = allow_uploads
-        certificate_path, private_key_path, self.certificate_fingerprint = (
-            create_host_certificate(self.storage_root)
-        )
         previous_storage_dir = os.environ.get("SAVE_STORAGE_DIR")
         os.environ["SAVE_STORAGE_DIR"] = str(storage_root)
         try:
@@ -225,8 +171,6 @@ class EmbeddedHostServer:
                 port=port,
                 log_level="warning",
                 log_config=None,
-                ssl_certfile=str(certificate_path),
-                ssl_keyfile=str(private_key_path),
             )
         )
         self.thread = threading.Thread(
@@ -254,51 +198,10 @@ class EmbeddedHostServer:
             raise RuntimeError("Сервер не завершился за отведённое время")
 
 
-class PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(
-        self,
-        host: str,
-        fingerprint: str,
-        **kwargs,
-    ):
-        self.fingerprint = fingerprint
-        super().__init__(
-            host,
-            context=make_pinned_ssl_context(fingerprint),
-            **kwargs,
-        )
-
-    def connect(self) -> None:
-        super().connect()
-        if self.sock is None:
-            raise ssl.SSLError("HTTPS-соединение не установлено")
-        verify_peer_fingerprint(self.sock, self.fingerprint)
-
-
-class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, fingerprint: str):
-        self.fingerprint = fingerprint
-        super().__init__(context=make_pinned_ssl_context(fingerprint))
-
-    def https_open(self, request):
-        return self.do_open(
-            lambda host, **kwargs: PinnedHTTPSConnection(
-                host,
-                self.fingerprint,
-                **kwargs,
-            ),
-            request,
-        )
-
-
 def open_url(
     request: urllib.request.Request,
     timeout: int,
-    fingerprint: str | None = None,
 ):
-    if fingerprint:
-        opener = urllib.request.build_opener(PinnedHTTPSHandler(fingerprint))
-        return opener.open(request, timeout=timeout)
     return urllib.request.urlopen(request, timeout=timeout)
 
 
@@ -521,6 +424,64 @@ class SaveChangeHandler(FileSystemEventHandler):
             self.ignore_until = time.monotonic() + 3
 
 
+def minecraft_world_directories(saves_directory: Path) -> dict[str, Path]:
+    if not saves_directory.is_dir():
+        return {}
+    return {
+        child.name: child
+        for child in saves_directory.iterdir()
+        if child.is_dir()
+        and (child / "level.dat").is_file()
+    }
+
+
+def minecraft_world_name(game: str) -> str | None:
+    if not game.startswith(MINECRAFT_WORLD_PREFIX):
+        return None
+    name = game[len(MINECRAFT_WORLD_PREFIX):]
+    if (
+        not name
+        or name in (".", "..")
+        or Path(name).name != name
+        or any(character in name for character in '<>:"/\\|?*')
+        or any(ord(character) < 32 for character in name)
+        or name.rstrip(" .") != name
+        or name.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
+    ):
+        return None
+    return name
+
+
+def game_is_running(
+    game: str,
+    processes: list[dict[str, object]],
+    profiles: tuple[GameProfile, ...],
+) -> bool:
+    profile_name = "Minecraft" if game.startswith(MINECRAFT_WORLD_PREFIX) else game
+    profile = next((item for item in profiles if item.name == profile_name), None)
+    if profile is None:
+        return False
+    for process in processes:
+        process_names = {
+            Path(str(value)).name.casefold()
+            for value in (process.get("name"), process.get("exe"))
+            if value
+        }
+        if not process_names.intersection(profile.process_names):
+            continue
+        raw_command_line = process.get("cmdline") or []
+        command_line = (
+            " ".join(str(part) for part in raw_command_line)
+            if isinstance(raw_command_line, (list, tuple))
+            else str(raw_command_line)
+        ).casefold()
+        if not profile.process_markers or any(
+            marker in command_line for marker in profile.process_markers
+        ):
+            return True
+    return False
+
+
 def active_game_processes() -> list[dict[str, object]]:
     processes = []
     for process in psutil.process_iter(
@@ -617,38 +578,30 @@ class SaveSyncAPI:
         self,
         base_url: str,
         room: str,
-        password: str,
-        certificate_fingerprint: str = "",
     ):
         parsed = urllib.parse.urlsplit(base_url.strip())
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError("Укажите корректный адрес сервера (http:// или https://)")
         if parsed.query or parsed.fragment:
             raise ValueError("Адрес сервера не должен содержать query или fragment")
-        if not room or not password:
-            raise ValueError("Укажите код комнаты и пароль")
+        if not room:
+            raise ValueError("Укажите код доступа")
         self.base_url = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
         )
         self.room = urllib.parse.quote(room, safe="")
-        self.password = password
-        self.certificate_fingerprint = certificate_fingerprint.strip()
-        if self.certificate_fingerprint:
-            make_pinned_ssl_context(self.certificate_fingerprint)
 
     @staticmethod
     def create_room(
         base_url: str,
         name: str,
-        password: str,
-        certificate_fingerprint: str = "",
     ) -> dict[str, str]:
         parsed = urllib.parse.urlsplit(base_url.strip())
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError("Укажите корректный адрес сервера (http:// или https://)")
         if parsed.query or parsed.fragment:
             raise ValueError("Адрес сервера не должен содержать query или fragment")
-        payload = json.dumps({"name": name, "password": password}).encode("utf-8")
+        payload = json.dumps({"name": name}).encode("utf-8")
         url = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/api/rooms", "", "")
         )
@@ -662,11 +615,13 @@ class SaveSyncAPI:
             with open_url(
                 request,
                 timeout=30,
-                fingerprint=certificate_fingerprint,
             ) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             raise RuntimeError(f"Сервер ответил {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(f"Не удалось связаться с сервером: {exc}") from exc
@@ -678,18 +633,7 @@ class SaveSyncAPI:
         return f"{self.base_url}{path}"
 
     def _request(self, path: str) -> urllib.request.Request:
-        encoded_password = base64.urlsafe_b64encode(
-            self.password.encode("utf-8")
-        ).decode("ascii").rstrip("=")
-        headers = {"X-Room-Password": f"v1.{encoded_password}"}
-        if self.password.isascii() and all(
-            0x21 <= ord(character) <= 0x7E for character in self.password
-        ):
-            headers["X-Room-Token"] = self.password
-        return urllib.request.Request(
-            self._url(path),
-            headers=headers,
-        )
+        return urllib.request.Request(self._url(path))
 
     def list_saves(self, game: str) -> list[dict[str, str]]:
         query = urllib.parse.urlencode({"game": game})
@@ -698,11 +642,13 @@ class SaveSyncAPI:
             with open_url(
                 request,
                 timeout=30,
-                fingerprint=self.certificate_fingerprint,
             ) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             raise RuntimeError(f"Сервер ответил {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(f"Не удалось связаться с сервером: {exc}") from exc
@@ -716,11 +662,13 @@ class SaveSyncAPI:
             with open_url(
                 request,
                 timeout=30,
-                fingerprint=self.certificate_fingerprint,
             ) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             raise RuntimeError(f"Сервер ответил {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(f"Не удалось связаться с сервером: {exc}") from exc
@@ -757,27 +705,13 @@ class SaveSyncAPI:
         file_size = archive_path.stat().st_size
         content_length = sum(map(len, parts)) + len(file_header) + file_size + len(footer)
         parsed = urllib.parse.urlsplit(self.base_url)
-        if parsed.scheme == "https" and self.certificate_fingerprint:
-            connection = PinnedHTTPSConnection(
-                parsed.netloc,
-                self.certificate_fingerprint,
-                timeout=60,
-            )
-        elif parsed.scheme == "https":
+        if parsed.scheme == "https":
             connection = http.client.HTTPSConnection(parsed.netloc, timeout=60)
         else:
             connection = http.client.HTTPConnection(parsed.netloc, timeout=60)
         path = f"{parsed.path.rstrip('/')}/api/rooms/{self.room}/saves"
         try:
             connection.putrequest("POST", path)
-            encoded_password = base64.urlsafe_b64encode(
-                self.password.encode("utf-8")
-            ).decode("ascii").rstrip("=")
-            connection.putheader("X-Room-Password", f"v1.{encoded_password}")
-            if self.password.isascii() and all(
-                0x21 <= ord(character) <= 0x7E for character in self.password
-            ):
-                connection.putheader("X-Room-Token", self.password)
             connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
             connection.putheader("Content-Length", str(content_length))
             connection.endheaders()
@@ -797,7 +731,12 @@ class SaveSyncAPI:
         finally:
             connection.close()
 
-    def download(self, save_id: str, destination: Path) -> None:
+    def download(
+        self,
+        save_id: str,
+        destination: Path,
+        progress: Callable[[int, int | None], None] | None = None,
+    ) -> None:
         path = (
             f"/api/rooms/{self.room}/saves/"
             f"{urllib.parse.quote(save_id, safe='')}/download"
@@ -807,12 +746,23 @@ class SaveSyncAPI:
             with open_url(
                 request,
                 timeout=60,
-                fingerprint=self.certificate_fingerprint,
             ) as response:
+                try:
+                    total = int(response.headers.get("Content-Length", ""))
+                except (TypeError, ValueError):
+                    total = None
+                received = 0
                 with destination.open("wb") as output:
-                    shutil.copyfileobj(response, output, length=CHUNK_SIZE)
+                    while chunk := response.read(CHUNK_SIZE):
+                        output.write(chunk)
+                        received += len(chunk)
+                        if progress is not None:
+                            progress(received, total)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             raise RuntimeError(f"Сервер ответил {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise RuntimeError(f"Не удалось скачать сохранение: {exc}") from exc
@@ -822,8 +772,8 @@ class SaveSyncWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("SaveSync — общие сохранения")
-        self.root.geometry("1080x700")
-        self.root.minsize(860, 600)
+        self.root.geometry("860x560")
+        self.root.minsize(720, 480)
         self.events = Queue()
         self.entries: dict[str, dict[str, str]] = {}
         self.auto_enabled = tk.BooleanVar(value=True)
@@ -831,14 +781,10 @@ class SaveSyncWindow:
         self.inactive_since: dict[str, float] = {}
         self.suppressed_games: set[str] = set()
         self.custom_games: list[dict[str, str]] = []
+        self.minecraft_worlds: dict[str, Path] = {}
         self.settings_window = None
         self.settings_status = tk.StringVar()
-        self.host_connection_method_label = tk.StringVar(
-            value=HOST_CONNECTION_METHODS[DEFAULT_HOST_CONNECTION_METHOD]
-        )
         self.host_server: EmbeddedHostServer | None = None
-        self.host_mapping: PortMapping | None = None
-        self.host_connection_settings: tuple[str, str] | None = None
         self._local_sync_lock = threading.Lock()
         self._auto_upload_lock = threading.Lock()
         self._auto_uploading: set[str] = set()
@@ -849,17 +795,11 @@ class SaveSyncWindow:
             "mode": tk.StringVar(value="client"),
             "server": tk.StringVar(value="http://127.0.0.1:8000"),
             "room": tk.StringVar(),
-            "password": tk.StringVar(),
             "room_name": tk.StringVar(),
             "host_storage_dir": tk.StringVar(
                 value=str(config_path().parent / "host_data")
             ),
             "host_port": tk.StringVar(value=str(DEFAULT_HOST_PORT)),
-            "host_connection_method": tk.StringVar(
-                value=DEFAULT_HOST_CONNECTION_METHOD
-            ),
-            "host_vpn_address": tk.StringVar(),
-            "server_certificate_fingerprint": tk.StringVar(),
             "local_save_dir": tk.StringVar(
                 value=str(Path.home() / "SaveSyncReceived")
             ),
@@ -873,6 +813,8 @@ class SaveSyncWindow:
         }
         self.host_allow_uploads = tk.BooleanVar(value=True)
         self.local_sync_enabled = tk.BooleanVar(value=False)
+        self._download_indeterminate = False
+        self._configure_styles()
         self._build_ui()
         self._load_config()
         self._update_mode_controls()
@@ -882,26 +824,46 @@ class SaveSyncWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_ui(self) -> None:
-        mode_controls = ttk.Frame(self.root, padding=(12, 12, 12, 6))
-        mode_controls.pack(fill="x")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(4, weight=1)
+
+        header = ttk.Frame(self.root, padding=(14, 10, 14, 6))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        title_block = ttk.Frame(header)
+        title_block.grid(row=0, column=0, sticky="w")
+        ttk.Label(title_block, text="SaveSync", style="Title.TLabel").pack(
+            side="left"
+        )
+        ttk.Label(
+            title_block,
+            text="общие сохранения",
+            style="Subtitle.TLabel",
+        ).pack(side="left", padx=(8, 0), pady=(5, 0))
+
+        mode_controls = ttk.Frame(header)
+        mode_controls.grid(row=0, column=1, sticky="e")
         ttk.Radiobutton(
             mode_controls,
             text="Клиент",
             variable=self.values["mode"],
             value="client",
             command=self._mode_changed,
-        ).pack(side="left")
+            style="Mode.TRadiobutton",
+        ).pack(side="left", padx=(0, 3))
         ttk.Radiobutton(
             mode_controls,
-            text="Сервер / хост",
+            text="Локальный сервер",
             variable=self.values["mode"],
             value="host",
             command=self._mode_changed,
-        ).pack(side="left", padx=(0, 10))
+            style="Mode.TRadiobutton",
+        ).pack(side="left", padx=(0, 6))
         self.host_toggle_button = ttk.Button(
             mode_controls,
             text="Запустить сервер",
             command=self._toggle_host_server,
+            style="Primary.TButton",
         )
         self.host_toggle_button.pack(side="left")
         self.create_room_button = ttk.Button(
@@ -909,149 +871,273 @@ class SaveSyncWindow:
             text="Создать комнату",
             command=self._create_room_from_main,
         )
-        self.create_room_button.pack(side="left", padx=(6, 8))
+        self.create_room_button.pack(side="left", padx=(5, 0))
         self.local_sync_checkbox = ttk.Checkbutton(
             mode_controls,
-            text="Сохранять полученные сейвы на ПК",
+            text="Локальные копии",
             variable=self.local_sync_enabled,
             command=self._toggle_local_sync,
         )
-        self.local_sync_checkbox.pack(side="left", padx=8)
+        self.local_sync_checkbox.pack(side="left", padx=(6, 0))
 
-        form = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        form.pack(fill="x")
-        for column in range(2):
-            form.columnconfigure(column, weight=1, uniform="main-form")
         connection_frame = ttk.LabelFrame(
-            form,
+            self.root,
             text="Подключение",
-            padding=(10, 6),
+            style="Card.TLabelframe",
+            padding=(10, 5),
         )
-        connection_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        connection_frame.columnconfigure(1, weight=1)
-        for row, (label, key) in enumerate(
+        connection_frame.grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(0, 6)
+        )
+        connection_frame.columnconfigure(0, weight=3, uniform="connect")
+        connection_frame.columnconfigure(1, weight=2, uniform="connect")
+        connection_frame.columnconfigure(2, weight=1, uniform="connect")
+        for column, (label, key) in enumerate(
             (
-                ("Сервер", "server"),
-                ("Код комнаты", "room"),
-                ("Пароль", "password"),
+                ("Адрес сервера", "server"),
+                ("Код доступа", "room"),
+                ("Имя игрока", "player"),
             )
         ):
-            ttk.Label(connection_frame, text=label).grid(
-                row=row, column=0, sticky="w", pady=3
+            field = ttk.Frame(connection_frame, style="Card.TFrame")
+            field.grid(row=0, column=column, sticky="ew", padx=(0, 8))
+            field.columnconfigure(0, weight=1)
+            ttk.Label(field, text=label, style="Field.TLabel").grid(
+                row=0, column=0, sticky="w", pady=(0, 2)
             )
-            ttk.Entry(
-                connection_frame,
-                textvariable=self.values[key],
-                show="*" if key == "password" else "",
-            ).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+            ttk.Entry(field, textvariable=self.values[key]).grid(
+                row=1, column=0, sticky="ew"
+            )
 
         game_frame = ttk.LabelFrame(
-            form,
-            text="Игра и загрузка",
-            padding=(10, 6),
+            self.root,
+            text="Сейв",
+            style="Card.TLabelframe",
+            padding=(10, 5),
         )
-        game_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        game_frame.columnconfigure(1, weight=1)
-        ttk.Label(game_frame, text="Игра").grid(
-            row=0, column=0, sticky="w", pady=3
+        game_frame.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 6))
+        game_frame.columnconfigure(0, weight=2, uniform="save")
+        game_frame.columnconfigure(1, weight=3, uniform="save")
+        game_field = ttk.Frame(game_frame, style="Card.TFrame")
+        game_field.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        ttk.Label(game_field, text="Игра или мир", style="Field.TLabel").pack(
+            anchor="w", pady=(0, 2)
         )
         self.game_dropdown = ttk.Combobox(
-            game_frame,
+            game_field,
             textvariable=self.values["game"],
             values=self._game_choices(),
             state="readonly",
         )
-        self.game_dropdown.grid(
-            row=0, column=1, sticky="ew", padx=(8, 0), pady=3
-        )
-        ttk.Label(game_frame, text="Кто загружает").grid(
-            row=1, column=0, sticky="w", pady=3
-        )
-        ttk.Entry(game_frame, textvariable=self.values["player"]).grid(
-            row=1, column=1, sticky="ew", padx=(8, 0), pady=3
-        )
-        ttk.Label(game_frame, text="Папка сохранений").grid(
-            row=2, column=0, sticky="w", pady=3
-        )
-        ttk.Entry(game_frame, textvariable=self.values["folder"]).grid(
-            row=2, column=1, sticky="ew", padx=(8, 6), pady=3
+        self.game_dropdown.pack(fill="x")
+        folder_field = ttk.Frame(game_frame, style="Card.TFrame")
+        folder_field.grid(row=0, column=1, sticky="ew")
+        folder_field.columnconfigure(0, weight=1)
+        ttk.Label(
+            folder_field,
+            text="Папка сейвов (если нужно указать вручную)",
+            style="Field.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ttk.Entry(folder_field, textvariable=self.values["folder"]).grid(
+            row=1, column=0, sticky="ew", padx=(0, 6)
         )
         ttk.Button(
-            game_frame,
+            folder_field,
             text="Обзор…",
             command=self._choose_folder,
-        ).grid(row=2, column=2, pady=3)
+        ).grid(row=1, column=1, sticky="ew")
 
-        actions = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        actions.pack(fill="x")
-        action_buttons = ttk.Frame(actions)
-        action_buttons.pack(side="left")
+        actions = ttk.Frame(self.root, padding=(14, 0, 14, 6))
+        actions.grid(row=3, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        left_actions = ttk.Frame(actions)
+        left_actions.grid(row=0, column=0, sticky="w")
         ttk.Button(
-            action_buttons,
-            text="Обновить список",
+            left_actions,
+            text="Обновить",
             command=self._refresh,
         ).pack(side="left")
         ttk.Button(
-            action_buttons,
-            text="Загрузить мой сейв",
+            left_actions,
+            text="Загрузить сейв",
             command=self._upload,
-        ).pack(side="left", padx=8)
+            style="Primary.TButton",
+        ).pack(side="left", padx=(6, 0))
         ttk.Button(
-            action_buttons,
-            text="Скачать и закинуть",
+            left_actions,
+            text="Скачать и восстановить",
             command=self._download,
-        ).pack(side="left")
-        ttk.Button(
-            actions,
-            text="Настройки…",
-            command=self._open_settings,
-        ).pack(side="right")
+        ).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(
-            self.root,
-            text="Автоотправка изменений сейвов активных игр",
+            actions,
+            text="Автоотправка",
             variable=self.auto_enabled,
             command=self._toggle_auto_monitoring,
-        ).pack(anchor="w", padx=14, pady=(0, 8))
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ttk.Button(
+            actions,
+            text="Настройки",
+            command=self._open_settings,
+        ).grid(row=0, column=2, sticky="e", padx=(8, 0))
 
-        list_frame = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        list_frame.pack(fill="both", expand=True)
+        list_frame = ttk.Frame(self.root, padding=(14, 0, 14, 6))
+        list_frame.grid(row=4, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
         columns = ("game", "uploaded_by", "created_at")
         self.table = ttk.Treeview(
             list_frame,
             columns=columns,
             show="headings",
-            height=14,
+            height=6,
+            style="Saves.Treeview",
         )
         self.table.heading("game", text="Игра")
         self.table.heading("uploaded_by", text="Загрузил")
         self.table.heading("created_at", text="Время загрузки (UTC)")
-        self.table.column("game", width=220)
-        self.table.column("uploaded_by", width=150)
-        self.table.column("created_at", width=300)
+        self.table.column("game", width=220, minwidth=140)
+        self.table.column("uploaded_by", width=150, minwidth=100)
+        self.table.column("created_at", width=300, minwidth=170)
         scrollbar = ttk.Scrollbar(
             list_frame,
             orient="vertical",
             command=self.table.yview,
         )
         self.table.configure(yscrollcommand=scrollbar.set)
-        self.table.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        status_frame = ttk.Frame(self.root, padding=(12, 0, 12, 10))
-        status_frame.pack(fill="x")
-        self.status = tk.StringVar(value="Укажите сервер и данные комнаты")
-        ttk.Label(status_frame, textvariable=self.status).pack(anchor="w")
+        self.table.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        status_frame = ttk.Frame(self.root, padding=(14, 0, 14, 10))
+        status_frame.grid(row=5, column=0, sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+        self.status = tk.StringVar(value="Укажите адрес сервера и код доступа")
+        ttk.Label(status_frame, textvariable=self.status, style="Status.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.download_progress = ttk.Progressbar(
+            status_frame,
+            mode="determinate",
+            maximum=100,
+            length=140,
+        )
+        self.download_progress.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.download_progress.grid_remove()
         self.monitor_status = tk.StringVar(value="Ищу запущенные игры…")
         ttk.Label(
             status_frame,
             textvariable=self.monitor_status,
-            wraplength=1000,
-        ).pack(anchor="w", pady=(3, 0))
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self.root.configure(background="#f3f5f9")
+        self.root.option_add("*Font", ("Segoe UI", 9))
+        style.configure("TFrame", background="#f3f5f9")
+        style.configure("Card.TLabelframe", background="#ffffff", padding=7)
+        style.configure("Card.TFrame", background="#ffffff")
+        style.configure(
+            "Card.TLabelframe.Label",
+            background="#ffffff",
+            foreground="#334155",
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure("TLabel", background="#f3f5f9", foreground="#243247")
+        style.configure(
+            "Field.TLabel",
+            background="#ffffff",
+            foreground="#64748b",
+            font=("Segoe UI", 8),
+        )
+        style.configure(
+            "Title.TLabel",
+            background="#f3f5f9",
+            foreground="#172033",
+            font=("Segoe UI", 17, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background="#f3f5f9",
+            foreground="#64748b",
+            font=("Segoe UI", 8),
+        )
+        style.configure(
+            "Status.TLabel",
+            background="#f3f5f9",
+            foreground="#334155",
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure("TButton", padding=(9, 5))
+        style.configure(
+            "Primary.TButton",
+            background="#2563eb",
+            foreground="#ffffff",
+            padding=(10, 5),
+            borderwidth=0,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", "#1d4ed8"), ("disabled", "#94a3b8")],
+            foreground=[("disabled", "#f8fafc")],
+        )
+        style.configure("Mode.TRadiobutton", background="#f3f5f9", padding=(4, 5))
+        style.configure("TEntry", padding=(5, 4), fieldbackground="#ffffff")
+        style.configure("TCombobox", padding=(5, 4), fieldbackground="#ffffff")
+        style.configure("TNotebook", background="#f3f5f9", borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            padding=(12, 6),
+            background="#e9eef5",
+            foreground="#475569",
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", "#ffffff")],
+            foreground=[("selected", "#1d4ed8")],
+        )
+        style.configure(
+            "Saves.Treeview",
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground="#243247",
+            rowheight=25,
+            borderwidth=0,
+        )
+        style.configure(
+            "Saves.Treeview.Heading",
+            background="#e9eef5",
+            foreground="#334155",
+            font=("Segoe UI", 9, "bold"),
+            padding=(7, 5),
+        )
+        style.map(
+            "Saves.Treeview",
+            background=[("selected", "#dbeafe")],
+            foreground=[("selected", "#1e3a8a")],
+        )
+        style.configure(
+            "Horizontal.TProgressbar",
+            troughcolor="#e2e8f0",
+            background="#2563eb",
+            borderwidth=0,
+        )
 
     def _game_profiles(self) -> tuple[GameProfile, ...]:
         return game_profiles_with_custom(self.custom_games)
 
     def _game_choices(self) -> tuple[str, ...]:
-        return (ALL_GAMES, *(profile.name for profile in self._game_profiles()))
+        available = {
+            entry["game"]
+            for entry in self.entries.values()
+            if minecraft_world_name(entry.get("game", "")) is not None
+        }
+        available.update(self.minecraft_worlds)
+        return (
+            ALL_GAMES,
+            *(profile.name for profile in self._game_profiles()),
+            *sorted(available),
+        )
 
     def _mode_changed(self) -> None:
         if self.values["mode"].get() != "host" and self.host_server is not None:
@@ -1112,12 +1198,6 @@ class SaveSyncWindow:
         if self.host_server is not None:
             return
         storage_root, port = self._host_parameters()
-        connection_method = self.values["host_connection_method"].get()
-        vpn_address = (
-            self.values["host_vpn_address"].get().strip()
-            if connection_method in ("radmin", "porthole")
-            else ""
-        )
         storage_root.mkdir(parents=True, exist_ok=True)
         server = EmbeddedHostServer(
             storage_root,
@@ -1125,26 +1205,15 @@ class SaveSyncWindow:
             self.host_allow_uploads.get(),
         )
         server.start()
-        mapping = None
         try:
-            if connection_method == "upnp":
-                mapping = add_upnp_port_mapping(port, self._lan_address())
-                connection_url = host_connection_url(mapping.external_address, port)
-            elif connection_method in ("radmin", "porthole"):
-                connection_url = host_vpn_connection_url(vpn_address, port)
-            else:
-                raise ValueError("Выберите способ подключения в настройках хоста.")
+            lan_address = self._lan_address()
+            connection_url = local_server_url(lan_address, port)
         except Exception:
             server.stop()
             raise
         self.host_server = server
-        self.host_mapping = mapping
-        self.host_connection_settings = (connection_method, vpn_address)
         self._update_mode_controls()
         self.values["server"].set(connection_url)
-        self.values["server_certificate_fingerprint"].set(
-            server.certificate_fingerprint
-        )
         try:
             self._save_config()
         except OSError as exc:
@@ -1152,24 +1221,12 @@ class SaveSyncWindow:
                 f"Сервер запущен, но адрес не удалось сохранить в настройках: {exc}"
             )
             return
-        access_method = HOST_CONNECTION_METHODS[connection_method]
-        access_scope = (
-            "доступен извне"
-            if connection_method == "upnp"
-            else f"доступен через {access_method}"
-        )
-        porthole_status = (
-            f"; для Porthole выберите процесс {Path(sys.executable).name} "
-            f"и откройте TCP-порт {port} на адресе 127.0.0.1"
-            if connection_method == "porthole"
-            else ""
-        )
         self.status.set(
-            f"Сервер {access_scope}: {connection_url}; "
-            f"{porthole_status.lstrip('; ')}"
-            f"{'; ' if porthole_status else ''}"
-            f"SHA-256 сертификата: {server.certificate_fingerprint}; "
-            f"загрузка сейвов клиентами "
+            f"Локальный сервер запущен: {connection_url}. "
+            f"В Porthole выберите процесс {Path(sys.executable).name}, "
+            f"TCP-порт {port}, адрес назначения {lan_address}. "
+            "Друзьям передайте внешний адрес, показанный Porthole, и код комнаты. "
+            "Загрузка сейвов клиентами "
             f"{'разрешена' if self.host_allow_uploads.get() else 'запрещена'}"
         )
 
@@ -1180,16 +1237,6 @@ class SaveSyncWindow:
             current.storage_root != storage_root.resolve()
             or current.port != port
             or current.allow_uploads != self.host_allow_uploads.get()
-            or self.host_connection_settings
-            != (
-                self.values["host_connection_method"].get(),
-                (
-                    self.values["host_vpn_address"].get().strip()
-                    if self.values["host_connection_method"].get()
-                    in ("radmin", "porthole")
-                    else ""
-                ),
-            )
         ):
             self._stop_host_server()
         if self.host_server is None:
@@ -1201,18 +1248,8 @@ class SaveSyncWindow:
         server = self.host_server
         server.stop()
         self.host_server = None
-        mapping = self.host_mapping
-        self.host_mapping = None
-        self.host_connection_settings = None
-        try:
-            if mapping is not None:
-                mapping.remove()
-        finally:
-            self._update_mode_controls()
-        self.status.set(
-            "Сервер остановлен"
-            + ("; проброс UPnP удалён" if mapping is not None else "")
-        )
+        self._update_mode_controls()
+        self.status.set("Локальный сервер остановлен")
 
     def _toggle_host_server(self) -> None:
         if self.values["mode"].get() != "host":
@@ -1242,19 +1279,11 @@ class SaveSyncWindow:
         )
         if name is None:
             return
-        password = simpledialog.askstring(
-            "Новая комната",
-            "Пароль комнаты (не менее 8 символов):",
-            show="*",
-            parent=self.root,
-        )
-        if password is None:
-            return
         name = name.strip()
-        if not name or len(name) > 60 or not 8 <= len(password) <= 128:
+        if not name or len(name) > 60:
             messagebox.showerror(
                 "Новая комната",
-                "Название должно содержать до 60 символов, пароль — от 8 до 128.",
+                "Название комнаты должно содержать от 1 до 60 символов.",
                 parent=self.root,
             )
             return
@@ -1267,14 +1296,11 @@ class SaveSyncWindow:
             )
             return
         self.values["room_name"].set(name)
-        self.values["password"].set(password)
         connection_url = self.values["server"].get()
         self.values["server"].set(connection_url)
         self._create_room_request(
-            f"https://127.0.0.1:{port}",
+            f"http://127.0.0.1:{port}",
             name,
-            password,
-            self.host_server.certificate_fingerprint,
         )
 
     def _choose_host_storage_directory(self) -> None:
@@ -1284,17 +1310,6 @@ class SaveSyncWindow:
         )
         if directory:
             self.values["host_storage_dir"].set(directory)
-
-    def _host_connection_method_selected(self, event: tk.Event) -> None:
-        del event
-        selected_label = self.host_connection_method_label.get()
-        self.values["host_connection_method"].set(
-            next(
-                key
-                for key, label in HOST_CONNECTION_METHODS.items()
-                if label == selected_label
-            )
-        )
 
     def _choose_local_save_directory(self) -> None:
         directory = filedialog.askdirectory(
@@ -1312,18 +1327,18 @@ class SaveSyncWindow:
         window = tk.Toplevel(self.root)
         self.settings_window = window
         window.title("Настройки SaveSync")
-        window.geometry("1040x760")
-        window.minsize(860, 620)
+        window.geometry("860x620")
+        window.minsize(720, 500)
         window.transient(self.root)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(0, weight=1)
         window.protocol("WM_DELETE_WINDOW", self._close_settings)
 
         notebook = ttk.Notebook(window)
-        notebook.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 6))
-        connection_page = ttk.Frame(notebook, padding=8)
-        saves_page = ttk.Frame(notebook, padding=8)
-        games_page = ttk.Frame(notebook, padding=8)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 4))
+        connection_page = ttk.Frame(notebook, padding=6)
+        saves_page = ttk.Frame(notebook, padding=6)
+        games_page = ttk.Frame(notebook, padding=6)
         notebook.add(connection_page, text="Подключение")
         notebook.add(saves_page, text="Сейвы")
         notebook.add(games_page, text="Свои игры")
@@ -1337,7 +1352,7 @@ class SaveSyncWindow:
         host_frame = ttk.LabelFrame(
             connection_page,
             text="Режим сервера / хоста",
-            padding=10,
+            padding=7,
         )
         host_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
         host_frame.columnconfigure(1, weight=1)
@@ -1363,54 +1378,16 @@ class SaveSyncWindow:
             textvariable=self.values["host_port"],
             width=10,
         ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
-        ttk.Label(host_frame, text="Способ подключения").grid(
-            row=2, column=0, sticky="w", pady=4
-        )
-        self.host_connection_method_label.set(
-            HOST_CONNECTION_METHODS.get(
-                self.values["host_connection_method"].get(),
-                HOST_CONNECTION_METHODS["upnp"],
-            )
-        )
-        method_combo = ttk.Combobox(
-            host_frame,
-            textvariable=self.host_connection_method_label,
-            values=tuple(HOST_CONNECTION_METHODS.values()),
-            state="readonly",
-            width=18,
-        )
-        method_combo.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=4)
-        method_combo.bind(
-            "<<ComboboxSelected>>", self._host_connection_method_selected
-        )
-        ttk.Label(host_frame, text="IPv4-адрес хоста в сети").grid(
-            row=3, column=0, sticky="w", pady=4
-        )
-        vpn_address_dropdown = ttk.Combobox(
-            host_frame,
-            textvariable=self.values["host_vpn_address"],
-            state="normal",
-        )
-        vpn_address_dropdown.grid(
-            row=3, column=1, sticky="ew", padx=(8, 6), pady=4
-        )
-        ttk.Button(
-            host_frame,
-            text="Обновить адреса",
-            command=lambda: vpn_address_dropdown.configure(
-                values=local_ipv4_addresses()
-            ),
-        ).grid(row=3, column=2, pady=4)
-        vpn_address_dropdown.configure(values=local_ipv4_addresses())
         porthole_help = tk.StringVar()
 
         def update_porthole_help(*_args: str) -> None:
             port = self.values["host_port"].get().strip() or str(DEFAULT_HOST_PORT)
             porthole_help.set(
-                f"В Porthole нажмите «Настроить», выберите процесс "
-                f"{Path(sys.executable).name}, укажите адрес 127.0.0.1 и "
-                f"добавьте TCP-порт {port}. "
-                "Сначала запустите сервер SaveSync, чтобы процесс появился в списке."
+                f"Локальный сервер (HTTP) слушает все сетевые интерфейсы. "
+                f"Для Porthole выберите процесс {Path(sys.executable).name}, "
+                f"TCP-порт {port}, адрес назначения {self._lan_address()}. "
+                "Друзьям передайте внешний адрес из Porthole; код комнаты "
+                "передавайте отдельно."
             )
 
         self.values["host_port"].trace_add("write", update_porthole_help)
@@ -1418,24 +1395,22 @@ class SaveSyncWindow:
         ttk.Label(
             host_frame,
             textvariable=porthole_help,
-            wraplength=420,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 4))
+            wraplength=340,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 4))
         ttk.Checkbutton(
             host_frame,
             text="Разрешить другим клиентам загружать сейвы на этот ПК",
             variable=self.host_allow_uploads,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=4)
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
         ttk.Label(
             host_frame,
-            text="UPnP автоматически настраивает роутер (нужен публичный IPv4). "
-            "Для Radmin VPN или Porthole установите программу отдельно и выберите "
-            "адрес хоста, доступный друзьям через эту программу. SaveSync не "
-            "устанавливает и не настраивает их. "
-            "Сертификат HTTPS создаётся автоматически.",
-            wraplength=720,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 0))
+            text="Код доступа — единственный секрет комнаты. Не публикуйте его. "
+            "HTTP подходит для локальной сети и защищённого туннеля Porthole; "
+            "не используйте его напрямую в недоверенной сети.",
+            wraplength=330,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        room_frame = ttk.LabelFrame(connection_page, text="Комната", padding=10)
+        room_frame = ttk.LabelFrame(connection_page, text="Комната", padding=7)
         room_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
         room_frame.columnconfigure(1, weight=1)
         ttk.Label(room_frame, text="Название комнаты").grid(
@@ -1444,51 +1419,35 @@ class SaveSyncWindow:
         ttk.Entry(room_frame, textvariable=self.values["room_name"]).grid(
             row=0, column=1, sticky="ew", padx=(8, 0), pady=4
         )
-        ttk.Label(room_frame, text="Код подключения").grid(
+        ttk.Label(room_frame, text="Код доступа").grid(
             row=1, column=0, sticky="w", pady=4
         )
         ttk.Entry(room_frame, textvariable=self.values["room"]).grid(
             row=1, column=1, sticky="ew", padx=(8, 0), pady=4
         )
-        ttk.Label(room_frame, text="Пароль комнаты").grid(
-            row=2, column=0, sticky="w", pady=4
-        )
-        ttk.Entry(
-            room_frame,
-            textvariable=self.values["password"],
-            show="*",
-        ).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=4)
-        ttk.Label(room_frame, text="SHA-256 сертификата хоста (HTTPS)").grid(
-            row=3, column=0, sticky="w", pady=4
-        )
-        ttk.Entry(
-            room_frame,
-            textvariable=self.values["server_certificate_fingerprint"],
-        ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
         ttk.Label(
             room_frame,
-            text="Для сервера SaveSync вставьте отпечаток, который передал хост. "
-            "Так клиент проверяет, что подключился именно к нему. При Radmin VPN "
-            "или Porthole укажите адрес хоста, доступный через эту программу.",
-            wraplength=420,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            text="Участникам комнаты нужны адрес сервера и код доступа. "
+            "В режиме хоста используйте внешний адрес, выданный Porthole.",
+            wraplength=320,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
         room_actions = ttk.Frame(room_frame)
-        room_actions.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 2))
+        room_actions.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 2))
         ttk.Button(
             room_actions,
-            text="Создать комнату",
+            text="Создать",
             command=self._create_room_from_settings,
         ).pack(side="left")
         ttk.Button(
             room_actions,
-            text="Подключиться / проверить",
+            text="Проверить код",
             command=self._join_room_from_settings,
         ).pack(side="left", padx=8)
         ttk.Label(
             room_frame,
             textvariable=self.settings_status,
             wraplength=420,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         for column in range(2):
             saves_page.columnconfigure(
@@ -1496,7 +1455,7 @@ class SaveSyncWindow:
                 weight=1,
                 uniform="save-settings",
             )
-        saves_frame = ttk.LabelFrame(saves_page, text="Автосейвы", padding=10)
+        saves_frame = ttk.LabelFrame(saves_page, text="Автосейвы", padding=7)
         saves_frame.grid(row=0, column=0, sticky="new", padx=(0, 6), pady=4)
         saves_frame.columnconfigure(1, weight=1)
         ttk.Label(saves_frame, text="Интервал (минуты)").grid(
@@ -1529,7 +1488,7 @@ class SaveSyncWindow:
         local_frame = ttk.LabelFrame(
             saves_page,
             text="Локальные копии (режим клиента)",
-            padding=10,
+            padding=7,
         )
         local_frame.grid(row=0, column=1, sticky="new", padx=(6, 0), pady=4)
         local_frame.columnconfigure(1, weight=1)
@@ -1560,7 +1519,7 @@ class SaveSyncWindow:
         games_frame = ttk.LabelFrame(
             games_page,
             text="Пользовательские игры",
-            padding=10,
+            padding=7,
         )
         games_frame.pack(fill="both", expand=True, padx=4, pady=4)
         games_frame.columnconfigure(1, weight=1)
@@ -1596,7 +1555,7 @@ class SaveSyncWindow:
             games_frame,
             text="Если указать процесс, папка будет отслеживаться, когда игра запущена. "
             "Без процесса игру можно выбрать для ручной загрузки и скачивания.",
-            wraplength=900,
+            wraplength=700,
         ).grid(row=3, column=0, columnspan=3, sticky="nw", pady=(2, 6))
 
         columns = ("name", "directory", "process")
@@ -1604,7 +1563,7 @@ class SaveSyncWindow:
             games_frame,
             columns=columns,
             show="headings",
-            height=7,
+            height=5,
             selectmode="browse",
         )
         self.custom_game_table.heading("name", text="Игра")
@@ -1644,14 +1603,11 @@ class SaveSyncWindow:
 
     def _create_room_from_settings(self) -> None:
         name = self.values["room_name"].get().strip()
-        password = self.values["password"].get()
-        if not name or not password:
-            self.settings_status.set("Укажите название комнаты и пароль.")
+        if not name:
+            self.settings_status.set("Укажите название комнаты.")
             return
-        if len(name) > 60 or len(password) < 8 or len(password) > 128:
-            self.settings_status.set(
-                "Название комнаты: до 60 символов; пароль: от 8 до 128 символов."
-            )
+        if len(name) > 60:
+            self.settings_status.set("Название комнаты должно быть не длиннее 60 символов.")
             return
         if self.values["mode"].get() == "host":
             try:
@@ -1660,22 +1616,18 @@ class SaveSyncWindow:
                 _, port = self._host_parameters()
                 if self.host_server is None:
                     raise RuntimeError("Сервер не запущен")
-                base_url = f"https://127.0.0.1:{port}"
+                base_url = f"http://127.0.0.1:{port}"
             except Exception as exc:
                 self.settings_status.set(f"Не удалось запустить сервер: {exc}")
                 return
-            fingerprint = self.host_server.certificate_fingerprint
         else:
             base_url = self.values["server"].get()
-            fingerprint = self.values["server_certificate_fingerprint"].get().strip()
-        self._create_room_request(base_url, name, password, fingerprint)
+        self._create_room_request(base_url, name)
 
     def _create_room_request(
         self,
         base_url: str,
         name: str,
-        password: str,
-        certificate_fingerprint: str = "",
     ) -> None:
         self.settings_status.set("Создаю комнату…")
 
@@ -1684,8 +1636,6 @@ class SaveSyncWindow:
                 result = SaveSyncAPI.create_room(
                     base_url,
                     name,
-                    password,
-                    certificate_fingerprint,
                 )
                 self.events.put(("room-created", result))
             except Exception as exc:
@@ -1699,7 +1649,7 @@ class SaveSyncWindow:
         except Exception as exc:
             self.settings_status.set(str(exc))
             return
-        self.settings_status.set("Проверяю код и пароль комнаты…")
+        self.settings_status.set("Проверяю код доступа…")
 
         def connect() -> None:
             try:
@@ -1854,8 +1804,6 @@ class SaveSyncWindow:
             settings = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(settings, dict):
                 raise ValueError("Файл настроек должен содержать JSON-объект")
-            if "password" not in settings and isinstance(settings.get("token"), str):
-                settings["password"] = settings["token"]
             custom_games = settings.get("custom_games", [])
             if not isinstance(custom_games, list):
                 raise ValueError("Список пользовательских игр должен быть массивом")
@@ -1872,9 +1820,6 @@ class SaveSyncWindow:
             auto_enabled = settings.get("auto_enabled")
             if isinstance(auto_enabled, bool):
                 self.auto_enabled.set(auto_enabled)
-            settings["host_connection_method"] = normalize_host_connection_method(
-                settings.get("host_connection_method")
-            )
             host_allow_uploads = settings.get("host_allow_uploads")
             if isinstance(host_allow_uploads, bool):
                 self.host_allow_uploads.set(host_allow_uploads)
@@ -1943,8 +1888,6 @@ class SaveSyncWindow:
         return SaveSyncAPI(
             self.values["server"].get(),
             self.values["room"].get(),
-            self.values["password"].get(),
-            self.values["server_certificate_fingerprint"].get(),
         )
 
     def _toggle_local_sync(self) -> None:
@@ -1997,9 +1940,49 @@ class SaveSyncWindow:
         monitored = self.monitored.get(game)
         if monitored is not None:
             return monitored[0]
+        world_name = minecraft_world_name(game)
+        if world_name is not None:
+            local_path = self.minecraft_worlds.get(game)
+            if local_path is not None and local_path.is_dir():
+                return local_path
+            configured_folder = self.values["folder"].get().strip()
+            if configured_folder:
+                configured_path = Path(configured_folder).expanduser()
+                if (
+                    configured_path.name.casefold() == world_name.casefold()
+                    and (configured_path / "level.dat").is_file()
+                ):
+                    return configured_path
+            profile = next(
+                item for item in self._game_profiles() if item.name == "Minecraft"
+            )
+            candidates = game_save_candidates(profile)
+            root = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.is_dir()
+                ),
+                candidates[-1] if candidates else None,
+            )
+            return root / world_name if root is not None else None
+        if game.startswith(MINECRAFT_WORLD_PREFIX):
+            return None
         profile = next((item for item in self._game_profiles() if item.name == game), None)
         if profile is not None and profile.save_location == "custom":
             return profile.save_directory
+        if game == "Minecraft":
+            configured_folder = self.values["folder"].get().strip()
+            if configured_folder:
+                configured_path = Path(configured_folder).expanduser()
+                if (configured_path / "level.dat").is_file():
+                    return configured_path
+            worlds = [
+                path
+                for path in self.minecraft_worlds.values()
+                if path.is_dir()
+            ]
+            return worlds[0] if len(worlds) == 1 else None
         configured_folder = self.values["folder"].get().strip()
         if configured_folder:
             return Path(configured_folder).expanduser()
@@ -2051,7 +2034,7 @@ class SaveSyncWindow:
         if not self.auto_enabled.get():
             return
         try:
-            active = find_active_game_saves(
+            active_roots = find_active_game_saves(
                 active_game_processes(),
                 profiles=self._game_profiles(),
             )
@@ -2059,6 +2042,42 @@ class SaveSyncWindow:
             self.monitor_status.set(f"Не удалось проверить запущенные игры: {exc}")
             self.root.after(5000, self._scan_active_games)
             return
+
+        active: dict[str, Path | None] = {}
+        missing_paths = []
+        discovered_worlds: dict[str, Path] = {}
+        for game, save_path in active_roots.items():
+            if game != "Minecraft":
+                active[game] = save_path
+                continue
+            if save_path is None:
+                missing_paths.append("Minecraft (не найдена папка saves)")
+                continue
+            worlds = minecraft_world_directories(save_path)
+            if not worlds:
+                missing_paths.append("Minecraft (не найдены миры с level.dat)")
+                continue
+            for world_name, world_path in worlds.items():
+                world_label = f"{MINECRAFT_WORLD_PREFIX}{world_name}"
+                active[world_label] = world_path
+                discovered_worlds[world_label] = world_path
+
+        for game, path in self.minecraft_worlds.items():
+            if path.is_dir():
+                discovered_worlds.setdefault(game, path)
+        minecraft_profile = next(
+            profile
+            for profile in self._game_profiles()
+            if profile.name == "Minecraft"
+        )
+        for root in game_save_candidates(minecraft_profile):
+            for world_name, world_path in minecraft_world_directories(root).items():
+                discovered_worlds.setdefault(
+                    f"{MINECRAFT_WORLD_PREFIX}{world_name}",
+                    world_path,
+                )
+        self.minecraft_worlds = discovered_worlds
+        self.game_dropdown.configure(values=self._game_choices())
 
         now = time.monotonic()
         for game in list(self.monitored):
@@ -2072,7 +2091,6 @@ class SaveSyncWindow:
             if save_path is None or self.monitored[game][0] != save_path:
                 self._stop_monitor(game)
 
-        missing_paths = []
         monitor_errors = []
         for game, save_path in active.items():
             if save_path is None:
@@ -2086,7 +2104,6 @@ class SaveSyncWindow:
                 )
             )
             try:
-                save_path.mkdir(parents=True, exist_ok=True)
                 observer = Observer()
                 observer.schedule(handler, str(save_path), recursive=True)
                 observer.start()
@@ -2107,7 +2124,7 @@ class SaveSyncWindow:
             )
         if monitor_errors:
             status_parts.append("Ошибки отслеживания: " + "; ".join(monitor_errors))
-        if not active:
+        if not active_roots:
             status_parts.append("Поддерживаемые игры не запущены")
         self.monitor_status.set("; ".join(status_parts))
         self.root.after(5000, self._scan_active_games)
@@ -2252,6 +2269,14 @@ class SaveSyncWindow:
         if folder is None or not folder.is_dir():
             messagebox.showerror("Папка не найдена", "Выберите папку сохранений игры.")
             return
+        if game_is_running(game, active_game_processes(), self._game_profiles()):
+            messagebox.showerror(
+                "Закройте игру",
+                f"Закройте {game} перед ручной загрузкой сейва. "
+                "Автоматические снимки продолжают работать во время игры.",
+                parent=self.root,
+            )
+            return
         try:
             api = self._api()
             max_saves = int(self.values["max_saves_per_game"].get())
@@ -2260,6 +2285,10 @@ class SaveSyncWindow:
             return
 
         def upload() -> str:
+            if game_is_running(game, active_game_processes(), self._game_profiles()):
+                raise RuntimeError(
+                    f"Закройте {game} перед ручной загрузкой сейва."
+                )
             with tempfile.TemporaryDirectory(prefix="savesync-") as temporary:
                 archive_path = Path(temporary) / "save.zip"
                 create_archive(folder, archive_path)
@@ -2279,7 +2308,13 @@ class SaveSyncWindow:
             return
         save = self.entries[selection[0]]
         game = save["game"]
-        if game not in self._game_choices():
+        if (
+            game not in self._game_choices()
+            or (
+                game not in {profile.name for profile in self._game_profiles()}
+                and minecraft_world_name(game) is None
+            )
+        ):
             messagebox.showerror(
                 "Неизвестная игра",
                 f"Игра «{game}» отсутствует в списке поддерживаемых.",
@@ -2287,8 +2322,16 @@ class SaveSyncWindow:
             )
             return
         folder = self._save_folder_for_game(save["game"])
-        if folder is None or not folder.is_dir():
+        is_minecraft_world = minecraft_world_name(game) is not None
+        if folder is None or (not is_minecraft_world and not folder.is_dir()):
             messagebox.showerror("Папка не найдена", "Выберите папку сохранений игры.")
+            return
+        if game_is_running(game, active_game_processes(), self._game_profiles()):
+            messagebox.showerror(
+                "Закройте игру",
+                f"Закройте {game} перед восстановлением, затем повторите скачивание.",
+                parent=self.root,
+            )
             return
         if not messagebox.askyesno(
             "Подтвердите замену",
@@ -2315,12 +2358,31 @@ class SaveSyncWindow:
         if monitored is not None:
             monitored[2].suspend()
         self.suppressed_games.add(game)
+        self.download_progress.configure(
+            mode="determinate",
+            maximum=100,
+            value=0,
+        )
+        self.download_progress.grid()
+        self._download_indeterminate = False
+
+        def report_progress(received: int, total: int | None) -> None:
+            self.events.put(("download-progress", (received, total)))
 
         def download() -> str:
             try:
                 with tempfile.TemporaryDirectory(prefix="savesync-") as temporary:
                     archive_path = Path(temporary) / "download.zip"
-                    api.download(save["id"], archive_path)
+                    api.download(save["id"], archive_path, report_progress)
+                    if game_is_running(
+                        game,
+                        active_game_processes(),
+                        self._game_profiles(),
+                    ):
+                        raise RuntimeError(
+                            f"Закройте {game} перед восстановлением сейва."
+                        )
+                    self.events.put(("download-phase", "Распаковываю архив…"))
                     safe_extract(archive_path, folder)
                 return "Сохранение скачано и распаковано."
             finally:
@@ -2336,6 +2398,9 @@ class SaveSyncWindow:
                 event, payload = self.events.get_nowait()
                 if event == "error":
                     self.status.set("Операция завершилась с ошибкой")
+                    self.download_progress.stop()
+                    self.download_progress.grid_remove()
+                    self._download_indeterminate = False
                     messagebox.showerror("Ошибка", str(payload), parent=self.root)
                 elif event == "room-created":
                     self.values["room"].set(payload["code"])
@@ -2349,16 +2414,15 @@ class SaveSyncWindow:
                         continue
                     self.settings_status.set(
                         f"Комната «{payload['name']}» создана. "
-                        f"Код подключения: {payload['code']}. "
-                        "Передайте друзьям код и пароль."
+                        f"Код доступа: {payload['code']}. Передайте его только "
+                        "участникам комнаты."
                     )
                     if self.values["mode"].get() == "host":
                         self.status.set(
                             f"Комната «{payload['name']}»: сервер "
-                            f"{self.values['server'].get()}, код {payload['code']}, "
-                            f"SHA-256 "
-                            f"{self.values['server_certificate_fingerprint'].get()}. "
-                            "Передайте друзьям адрес, код и отпечаток; пароль — отдельно."
+                            f"{self.values['server'].get()}, код доступа "
+                            f"{payload['code']}. Передайте друзьям внешний адрес "
+                            "Porthole и код доступа."
                         )
                 elif event == "room-joined":
                     room, save_count = payload
@@ -2396,7 +2460,42 @@ class SaveSyncWindow:
                     self.monitor_status.set(f"Ошибка автоотправки: {payload}")
                 elif event == "auto-uploaded":
                     self.monitor_status.set(f"Автосейв {payload} отправлен на сервер")
+                elif event == "download-progress":
+                    received, total = payload
+                    received_mb = received / (1024 * 1024)
+                    if total and total > 0:
+                        if self._download_indeterminate:
+                            self.download_progress.stop()
+                            self._download_indeterminate = False
+                        self.download_progress.configure(
+                            mode="determinate",
+                            maximum=total,
+                            value=received,
+                        )
+                        percent = received * 100 // total
+                        total_mb = total / (1024 * 1024)
+                        self.status.set(
+                            f"Скачиваю сейв: {percent}% "
+                            f"({received_mb:.1f}/{total_mb:.1f} МБ)"
+                        )
+                    else:
+                        if not self._download_indeterminate:
+                            self.download_progress.configure(mode="indeterminate")
+                            self.download_progress.start(12)
+                            self._download_indeterminate = True
+                        self.status.set(
+                            f"Скачиваю сейв: {received_mb:.1f} МБ"
+                        )
+                elif event == "download-phase":
+                    if not self._download_indeterminate:
+                        self.download_progress.configure(mode="indeterminate")
+                        self.download_progress.start(12)
+                        self._download_indeterminate = True
+                    self.status.set(str(payload))
                 elif isinstance(payload, list):
+                    self.download_progress.stop()
+                    self.download_progress.grid_remove()
+                    self._download_indeterminate = False
                     for row in self.table.get_children():
                         self.table.delete(row)
                     self.entries.clear()
@@ -2413,8 +2512,12 @@ class SaveSyncWindow:
                                 save["created_at"],
                             ),
                         )
+                    self.game_dropdown.configure(values=self._game_choices())
                     self.status.set(f"Найдено сохранений: {len(payload)}")
                 else:
+                    self.download_progress.stop()
+                    self.download_progress.grid_remove()
+                    self._download_indeterminate = False
                     self.status.set(str(payload))
         except Empty:
             pass

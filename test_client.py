@@ -5,9 +5,6 @@ import socket
 import urllib.request
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
-
 import client
 from client import (
     ALL_GAMES,
@@ -20,11 +17,11 @@ from client import (
     custom_game_profiles,
     find_active_game_saves,
     auto_upload_delay,
-    host_connection_url,
-    host_vpn_connection_url,
-    local_ipv4_addresses,
+    game_is_running,
+    local_server_url,
     local_snapshot_path,
-    normalize_host_connection_method,
+    minecraft_world_directories,
+    minecraft_world_name,
     open_url,
     save_remote_saves_locally,
     safe_extract,
@@ -241,54 +238,50 @@ class AutoUploadScheduleTests(unittest.TestCase):
         self.assertEqual(auto_upload_delay(5, 100, 500), 0)
 
 
-class HostConnectionAddressTests(unittest.TestCase):
-    def test_porthole_is_default_and_legacy_name_is_migrated(self):
-        self.assertEqual(client.DEFAULT_HOST_CONNECTION_METHOD, "porthole")
-        self.assertEqual(normalize_host_connection_method(None), "porthole")
-        self.assertEqual(normalize_host_connection_method("portholl"), "porthole")
-        self.assertEqual(normalize_host_connection_method("upnp"), "upnp")
-
-    def test_builds_remote_https_url_from_public_ipv4_or_dns(self):
+class LocalServerAddressTests(unittest.TestCase):
+    def test_builds_http_url_for_lan_ipv4(self):
         self.assertEqual(
-            host_connection_url("8.8.8.8", 8765),
-            "https://8.8.8.8:8765",
-        )
-        self.assertEqual(
-            host_connection_url("savesync.example.net", 8765),
-            "https://savesync.example.net:8765",
+            local_server_url("192.168.1.5", 8765),
+            "http://192.168.1.5:8765",
         )
 
-    def test_rejects_addresses_with_scheme_or_invalid_port(self):
-        with self.assertRaisesRegex(ValueError, "публичный IPv4"):
-            host_connection_url("https://example.com", 8765)
+    def test_rejects_loopback_and_invalid_port(self):
+        with self.assertRaisesRegex(ValueError, "IPv4"):
+            local_server_url("127.0.0.1", 8765)
         with self.assertRaisesRegex(ValueError, "Порт"):
-            host_connection_url("8.8.8.8", 70000)
+            local_server_url("192.168.1.5", 70000)
 
-    def test_builds_vpn_url_and_rejects_non_vpn_addresses(self):
-        self.assertEqual(
-            host_vpn_connection_url("26.12.34.56", 8765),
-            "https://26.12.34.56:8765",
-        )
-        for address in ("127.0.0.1", "0.0.0.0", "not-an-ip"):
-            with self.subTest(address=address), self.assertRaises(ValueError):
-                host_vpn_connection_url(address, 8765)
 
-    def test_lists_unique_non_loopback_ipv4_addresses(self):
-        interfaces = {
-            "Radmin VPN": [
-                SimpleNamespace(family=socket.AF_INET, address="26.12.34.56"),
-                SimpleNamespace(family=socket.AF_INET, address="26.12.34.56"),
-            ],
-            "Local": [
-                SimpleNamespace(family=socket.AF_INET, address="127.0.0.1"),
-                SimpleNamespace(family=socket.AF_INET, address="192.168.1.5"),
-            ],
-        }
-        with patch("client.psutil.net_if_addrs", return_value=interfaces):
+class MinecraftWorldTests(unittest.TestCase):
+    def test_only_directories_with_level_dat_are_worlds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            saves = Path(temporary)
+            valid = saves / "My world"
+            valid.mkdir()
+            (valid / "level.dat").write_bytes(b"world")
+            invalid = saves / "not a world"
+            invalid.mkdir()
+            (invalid / "options.txt").write_text("x", encoding="utf-8")
+
             self.assertEqual(
-                local_ipv4_addresses(),
-                ["26.12.34.56", "192.168.1.5"],
+                minecraft_world_directories(saves),
+                {"My world": valid},
             )
+            self.assertEqual(minecraft_world_name("Minecraft — My world"), "My world")
+            self.assertIsNone(minecraft_world_name("Minecraft — ../escape"))
+
+    def test_world_process_check_detects_running_minecraft_client(self):
+        processes = [
+            {
+                "name": "javaw.exe",
+                "cmdline": ["javaw.exe", "net.minecraft.client.main.Main"],
+            }
+        ]
+
+        self.assertTrue(
+            game_is_running("Minecraft — My world", processes, GAME_PROFILES)
+        )
+        self.assertFalse(game_is_running("Minecraft — My world", [], GAME_PROFILES))
 
 
 class LocalSnapshotPathTests(unittest.TestCase):
@@ -343,35 +336,23 @@ class EmbeddedHostServerTests(unittest.TestCase):
             self.assertIsNone(server.server.config.log_config)
             try:
                 server.start()
-                base_url = f"https://127.0.0.1:{port}"
+                base_url = f"http://127.0.0.1:{port}"
                 with open_url(
                     urllib.request.Request(f"{base_url}/health"),
                     timeout=5,
-                    fingerprint=server.certificate_fingerprint,
                 ) as response:
                     self.assertEqual(response.status, 200)
                     self.assertEqual(response.read(), b'{"status":"ok"}')
                 room = SaveSyncAPI.create_room(
                     base_url,
                     "Host integration",
-                    "password123",
-                    server.certificate_fingerprint,
                 )
-                api = SaveSyncAPI(
-                    base_url,
-                    room["code"],
-                    "password123",
-                    server.certificate_fingerprint,
-                )
+                self.assertEqual(len(room["code"]), 24)
+                api = SaveSyncAPI(base_url, room["code"])
                 self.assertEqual(api.room_info()["name"], "Host integration")
-                wrong_pin_api = SaveSyncAPI(
-                    base_url,
-                    room["code"],
-                    "password123",
-                    "0" * 64,
-                )
-                with self.assertRaisesRegex(RuntimeError, "отпечаток"):
-                    wrong_pin_api.room_info()
+                wrong_code_api = SaveSyncAPI(base_url, "A" * 24)
+                with self.assertRaisesRegex(RuntimeError, "401"):
+                    wrong_code_api.room_info()
                 source = Path(temporary) / "game-save"
                 source.mkdir()
                 (source / "world.dat").write_text("save", encoding="utf-8")
@@ -384,6 +365,17 @@ class EmbeddedHostServerTests(unittest.TestCase):
                 self.assertEqual(len(saves), 1)
                 self.assertEqual(saves[0]["game"], "Minecraft")
                 self.assertEqual(saves[0]["uploaded_by"], "Alice")
+                downloaded_path = Path(temporary) / "downloaded.zip"
+                progress = []
+                api.download(
+                    saves[0]["id"],
+                    downloaded_path,
+                    lambda received, total: progress.append((received, total)),
+                )
+                self.assertEqual(downloaded_path.read_bytes(), archive_path.read_bytes())
+                self.assertTrue(progress)
+                self.assertEqual(progress[-1][0], downloaded_path.stat().st_size)
+                self.assertEqual(progress[-1][1], downloaded_path.stat().st_size)
             finally:
                 server.stop()
 
