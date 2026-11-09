@@ -492,11 +492,18 @@ class EmbeddedHostServerTests(unittest.TestCase):
                 archive_path = Path(temporary) / "upload.zip"
                 create_archive(source, archive_path)
 
-                api.upload("Minecraft", "Alice", archive_path, max_saves=2)
+                api.upload(
+                    "Minecraft",
+                    "Alice",
+                    archive_path,
+                    max_saves=2,
+                    save_name="game-save",
+                )
 
                 saves = api.list_saves("")
                 self.assertEqual(len(saves), 1)
                 self.assertEqual(saves[0]["game"], "Minecraft")
+                self.assertEqual(saves[0]["save_name"], "game-save")
                 self.assertEqual(saves[0]["uploaded_by"], "Alice")
                 downloaded_path = Path(temporary) / "downloaded.zip"
                 progress = []

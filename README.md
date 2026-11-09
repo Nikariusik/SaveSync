@@ -64,9 +64,10 @@ game while **Все игры** is selected.
 
 Use **Загрузить мой сейв** to upload a folder manually, **Обновить список** to
 see available archives, and select an archive before pressing **Скачать и
-закинуть**. The client shows download progress and asks before extracting because files
-with matching names can be replaced. Close the game before manual upload or
-restore; automatic snapshots remain enabled while a game is running.
+закинуть**. Each archive shows its game, save-folder name, uploader, and upload
+time. The client shows download progress and asks before extracting because
+files with matching names can be replaced. Close the game before manual upload
+or restore; automatic snapshots remain enabled while a game is running.
 
 The client saves connection settings and custom game paths in the current
 user's application config directory. Treat that Windows account as trusted.
@@ -78,7 +79,7 @@ archives expanding beyond 10 GiB.
 
 ### Pre-release Windows executable
 
-The very early `v0.1.0-alpha.2` test build is available on the GitHub
+The very early `v0.1.0-alpha.3` test build is available on the GitHub
 [Releases page](https://github.com/Nikariusik/SaveSync/releases). It may contain
 bugs or lose data; keep separate backups of important worlds and saves. Please
 report issues with steps to reproduce them.

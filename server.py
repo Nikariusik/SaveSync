@@ -54,10 +54,18 @@ def create_app(
                 game TEXT NOT NULL,
                 uploaded_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                filename TEXT NOT NULL
+                filename TEXT NOT NULL,
+                save_name TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        save_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(saves)")
+        }
+        if "save_name" not in save_columns:
+            connection.execute(
+                "ALTER TABLE saves ADD COLUMN save_name TEXT NOT NULL DEFAULT ''"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS saves_room_game_time "
             "ON saves (room_id, game, created_at DESC)"
@@ -157,6 +165,7 @@ def create_app(
         uploaded_by: Annotated[str, Form()] = "Unknown",
         max_saves: Annotated[int | None, Form()] = None,
         archive: Annotated[UploadFile, File()] = ...,
+        save_name: Annotated[str | None, Form()] = None,
     ) -> dict[str, str | int]:
         if not allow_uploads:
             raise HTTPException(
@@ -169,6 +178,12 @@ def create_app(
             raise HTTPException(status_code=400, detail="Game name must be 1-100 characters")
         if len(uploaded_by) > 80:
             raise HTTPException(status_code=400, detail="Uploader name is too long")
+        save_name = (save_name or game).strip()
+        if not save_name or len(save_name) > 100:
+            raise HTTPException(
+                status_code=400,
+                detail="Save name must be 1-100 characters",
+            )
         if max_saves is not None and not 1 <= max_saves <= MAX_SAVES_PER_PLAYER_GAME:
             raise HTTPException(
                 status_code=400,
@@ -209,9 +224,18 @@ def create_app(
             created_at = datetime.now(timezone.utc).isoformat()
             with connect_db() as connection:
                 connection.execute(
-                    "INSERT INTO saves (id, room_id, game, uploaded_by, created_at, filename) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (save_id, room_id, game, uploaded_by, created_at, final_path.name),
+                    "INSERT INTO saves "
+                    "(id, room_id, game, uploaded_by, created_at, filename, save_name) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        save_id,
+                        room_id,
+                        game,
+                        uploaded_by,
+                        created_at,
+                        final_path.name,
+                        save_name,
+                    ),
                 )
                 if max_saves is not None:
                     old_rows = connection.execute(
@@ -253,7 +277,8 @@ def create_app(
         game: str | None = None,
     ) -> list[dict[str, str]]:
         query = (
-            "SELECT id, game, uploaded_by, created_at FROM saves WHERE room_id = ?"
+            "SELECT id, game, uploaded_by, created_at, save_name "
+            "FROM saves WHERE room_id = ?"
         )
         parameters: list[str] = [room_id]
         if game:
@@ -263,7 +288,13 @@ def create_app(
         with connect_db() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [
-            {"id": row[0], "game": row[1], "uploaded_by": row[2], "created_at": row[3]}
+            {
+                "id": row[0],
+                "game": row[1],
+                "uploaded_by": row[2],
+                "created_at": row[3],
+                "save_name": row[4] or row[1],
+            }
             for row in rows
         ]
 

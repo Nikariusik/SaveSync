@@ -44,7 +44,7 @@ MIN_MAX_SAVES_PER_GAME = 1
 MAX_MAX_SAVES_PER_GAME = 100
 DEFAULT_HOST_PORT = 8765
 LOCAL_SAVE_SYNC_INTERVAL_MS = 30_000
-APP_VERSION = "0.1.0-alpha.2"
+APP_VERSION = "0.1.0-alpha.3"
 GITHUB_REPOSITORY_URL = "https://github.com/Nikariusik/SaveSync"
 GITHUB_RELEASES_API_URL = (
     "https://api.github.com/repos/Nikariusik/SaveSync/releases?per_page=100"
@@ -1003,11 +1003,14 @@ class SaveSyncAPI:
         uploaded_by: str,
         archive_path: Path,
         max_saves: int | None = None,
+        save_name: str | None = None,
     ) -> None:
         boundary = f"----SaveSync{uuid.uuid4().hex}"
         fields = {"game": game, "uploaded_by": uploaded_by}
         if max_saves is not None:
             fields["max_saves"] = str(max_saves)
+        if save_name is not None:
+            fields["save_name"] = save_name
         parts = []
         for name, value in fields.items():
             parts.append(
@@ -1306,7 +1309,7 @@ class SaveSyncWindow:
         list_frame.grid(row=4, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        columns = ("game", "uploaded_by", "created_at")
+        columns = ("game", "save_name", "uploaded_by", "created_at")
         self.table = ttk.Treeview(
             list_frame,
             columns=columns,
@@ -1315,11 +1318,13 @@ class SaveSyncWindow:
             style="Saves.Treeview",
         )
         self.table.heading("game", text="Игра")
+        self.table.heading("save_name", text="Сохранение")
         self.table.heading("uploaded_by", text="Загрузил")
         self.table.heading("created_at", text="Время загрузки (UTC)")
-        self.table.column("game", width=220, minwidth=140)
-        self.table.column("uploaded_by", width=150, minwidth=100)
-        self.table.column("created_at", width=300, minwidth=170)
+        self.table.column("game", width=150, minwidth=100)
+        self.table.column("save_name", width=180, minwidth=110)
+        self.table.column("uploaded_by", width=130, minwidth=90)
+        self.table.column("created_at", width=260, minwidth=160)
         scrollbar = ttk.Scrollbar(
             list_frame,
             orient="vertical",
@@ -1646,11 +1651,20 @@ class SaveSyncWindow:
             self.settings_window.lift()
             return
 
+        self.root.update_idletasks()
+        width, height = 860, 620
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2
+        x = max(0, min(x, screen_width - width))
+        y = max(0, min(y, screen_height - height))
+
         window = tk.Toplevel(self.root)
         self.settings_window = window
         window.title("Настройки SaveSync")
-        window.geometry("860x620")
-        window.minsize(720, 500)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+        window.minsize(520, 500)
         window.transient(self.root)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(0, weight=1)
@@ -2698,7 +2712,13 @@ class SaveSyncWindow:
                 with tempfile.TemporaryDirectory(prefix="savesync-auto-") as temporary:
                     archive_path = Path(temporary) / "save.zip"
                     create_archive(current_folder, archive_path)
-                    api.upload(game, player, archive_path, max_saves=max_saves)
+                    api.upload(
+                        game,
+                        player,
+                        archive_path,
+                        max_saves=max_saves,
+                        save_name=folder.name,
+                    )
             except Exception as exc:
                 with self._auto_upload_lock:
                     self._auto_uploading.discard(game)
@@ -2789,7 +2809,13 @@ class SaveSyncWindow:
             with tempfile.TemporaryDirectory(prefix="savesync-") as temporary:
                 archive_path = Path(temporary) / "save.zip"
                 create_archive(folder, archive_path)
-                api.upload(game, player, archive_path, max_saves=max_saves)
+                api.upload(
+                    game,
+                    player,
+                    archive_path,
+                    max_saves=max_saves,
+                    save_name=folder.name,
+                )
             return "Сейв загружен. Обновляю список…"
 
         def upload_and_refresh():
@@ -3058,12 +3084,18 @@ class SaveSyncWindow:
                     for save in payload:
                         item_id = save["id"]
                         self.entries[item_id] = save
+                        game = save["game"]
+                        world_name = minecraft_world_name(game)
+                        save_name = save.get("save_name", "").strip()
+                        if not save_name or save_name == game:
+                            save_name = world_name or "Сохранение"
                         self.table.insert(
                             "",
                             "end",
                             iid=item_id,
                             values=(
-                                save["game"],
+                                "Minecraft" if world_name is not None else game,
+                                save_name,
                                 save["uploaded_by"],
                                 save["created_at"],
                             ),

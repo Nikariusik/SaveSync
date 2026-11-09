@@ -20,6 +20,42 @@ def archive_bytes(content: str) -> bytes:
 
 
 class SaveRetentionTests(unittest.TestCase):
+    def test_existing_database_is_migrated_with_save_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            connection = sqlite3.connect(root / "saves.sqlite3")
+            try:
+                connection.execute(
+                    "CREATE TABLE saves ("
+                    "id TEXT PRIMARY KEY, room_id TEXT NOT NULL, "
+                    "game TEXT NOT NULL, uploaded_by TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL, filename TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO saves VALUES (?, ?, ?, ?, ?, ?)",
+                    ("save-id", "room-id", "Terraria", "Player", "now", "save.zip"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            create_app(root)
+
+            connection = sqlite3.connect(root / "saves.sqlite3")
+            try:
+                save_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(saves)")
+                }
+                saved_name = connection.execute(
+                    "SELECT save_name FROM saves WHERE id = ?",
+                    ("save-id",),
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+            self.assertIn("save_name", save_columns)
+            self.assertEqual(saved_name, "")
+
     def test_room_creation_supports_legacy_password_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
