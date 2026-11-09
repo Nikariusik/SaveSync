@@ -1,3 +1,4 @@
+import hashlib
 import ipaddress
 import importlib
 import http.client
@@ -7,6 +8,7 @@ import re
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +44,13 @@ MIN_MAX_SAVES_PER_GAME = 1
 MAX_MAX_SAVES_PER_GAME = 100
 DEFAULT_HOST_PORT = 8765
 LOCAL_SAVE_SYNC_INTERVAL_MS = 30_000
+APP_VERSION = "0.1.0-alpha.2"
+GITHUB_REPOSITORY_URL = "https://github.com/Nikariusik/SaveSync"
+GITHUB_RELEASES_API_URL = (
+    "https://api.github.com/repos/Nikariusik/SaveSync/releases?per_page=100"
+)
+GITHUB_RELEASES_URL = f"{GITHUB_REPOSITORY_URL}/releases"
+MAX_UPDATE_SIZE = 1024**3
 MINECRAFT_WORLD_PREFIX = "Minecraft — "
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -106,6 +116,97 @@ def local_server_url(address: str, port: int) -> str:
     if address_value.is_unspecified or address_value.is_loopback:
         raise ValueError("Укажите доступный в локальной сети IPv4-адрес.")
     return f"http://{address_value}:{port}"
+
+
+def parse_release_version(tag: str) -> tuple[int, int, int, int, int] | None:
+    match = re.fullmatch(
+        r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+        r"(?:-(alpha|beta|rc)\.(0|[1-9]\d*))?",
+        tag,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    major, minor, patch, prerelease, prerelease_number = match.groups()
+    prerelease_rank = {"alpha": 0, "beta": 1, "rc": 2, None: 3}
+    return (
+        int(major),
+        int(minor),
+        int(patch),
+        prerelease_rank[prerelease.casefold() if prerelease else None],
+        int(prerelease_number or 0),
+    )
+
+
+def newest_update_release(
+    releases: object,
+    current_version: str = APP_VERSION,
+) -> dict[str, object] | None:
+    current = parse_release_version(current_version)
+    if current is None:
+        raise ValueError(f"Внутренняя версия приложения некорректна: {current_version}")
+    if not isinstance(releases, list):
+        raise ValueError("GitHub вернул некорректный список релизов")
+
+    candidates = []
+    for release in releases:
+        if not isinstance(release, dict) or release.get("draft") is True:
+            continue
+        tag = release.get("tag_name")
+        version = parse_release_version(tag) if isinstance(tag, str) else None
+        if version is not None and version > current:
+            candidates.append((version, release))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def release_executable_asset(release: dict[str, object]) -> tuple[str, str, int]:
+    tag = release.get("tag_name")
+    if not isinstance(tag, str) or parse_release_version(tag) is None:
+        raise ValueError("Релиз имеет неподдерживаемый номер версии")
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise ValueError("В релизе отсутствует EXE-файл")
+    version_name = tag[1:] if tag[:1].casefold() == "v" else tag
+    expected_names = {
+        f"SaveSync-{tag}.exe",
+        f"SaveSync-{version_name}.exe",
+        "SaveSync.exe",
+    }
+    matching = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict) and asset.get("name") in expected_names
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            "В релизе должен быть ровно один совместимый файл SaveSync EXE"
+        )
+    asset = matching[0]
+    url = asset.get("browser_download_url")
+    if not isinstance(url, str):
+        raise ValueError("GitHub не указал ссылку на EXE")
+    parsed_url = urllib.parse.urlsplit(url)
+    expected_path = (
+        f"/Nikariusik/SaveSync/releases/download/"
+        f"{urllib.parse.quote(tag, safe='')}/{urllib.parse.quote(str(asset['name']), safe='')}"
+    )
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.netloc.casefold() != "github.com"
+        or parsed_url.path != expected_path
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise ValueError("Ссылка на EXE ведёт не на официальный релиз SaveSync")
+    digest = asset.get("digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+        raise ValueError("У файла релиза отсутствует корректная SHA-256 контрольная сумма")
+    size = asset.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_UPDATE_SIZE:
+        raise ValueError("Размер EXE в релизе некорректен или превышает 1 ГБ")
+    return url, digest.removeprefix("sha256:").lower(), size
 
 
 def safe_game_folder_name(game: str) -> str:
@@ -203,6 +304,226 @@ def open_url(
     timeout: int,
 ):
     return urllib.request.urlopen(request, timeout=timeout)
+
+
+def check_github_update() -> dict[str, object] | None:
+    request = urllib.request.Request(
+        GITHUB_RELEASES_API_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"SaveSync/{APP_VERSION}",
+        },
+    )
+    try:
+        with open_url(request, timeout=30) as response:
+            releases = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        finally:
+            exc.close()
+        raise RuntimeError(f"GitHub ответил {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Не удалось проверить GitHub: {exc}") from exc
+
+    release = newest_update_release(releases)
+    if release is not None:
+        release_executable_asset(release)
+    return release
+
+
+def download_update_executable(
+    release: dict[str, object],
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[Path, Path]:
+    url, expected_digest, expected_size = release_executable_asset(release)
+    download_directory = Path(
+        tempfile.mkdtemp(prefix="savesync-update-")
+    )
+    download_path = download_directory / "SaveSync-update.exe"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"SaveSync/{APP_VERSION}"},
+    )
+    digest = hashlib.sha256()
+    received = 0
+    try:
+        with open_url(request, timeout=60) as response:
+            final_url = urllib.parse.urlsplit(response.geturl())
+            final_host = (final_url.hostname or "").casefold()
+            if (
+                final_url.scheme != "https"
+                or not (
+                    final_host == "github.com"
+                    or final_host.endswith(".githubusercontent.com")
+                )
+            ):
+                raise RuntimeError("GitHub перенаправил скачивание на недоверенный адрес")
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    advertised_size = int(content_length)
+                except ValueError as exc:
+                    raise RuntimeError("GitHub вернул некорректный размер EXE") from exc
+                if advertised_size != expected_size:
+                    raise RuntimeError("Размер EXE не совпадает с данными релиза")
+            with download_path.open("wb") as output:
+                while chunk := response.read(CHUNK_SIZE):
+                    received += len(chunk)
+                    if received > expected_size or received > MAX_UPDATE_SIZE:
+                        raise RuntimeError("Скачанный EXE превышает указанный размер")
+                    digest.update(chunk)
+                    output.write(chunk)
+                    if progress is not None:
+                        progress(received, expected_size)
+        if received != expected_size:
+            raise RuntimeError("Скачанный EXE имеет неполный размер")
+        if digest.hexdigest() != expected_digest:
+            raise RuntimeError("SHA-256 скачанного EXE не совпадает с релизом GitHub")
+        return download_path, download_directory
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        finally:
+            exc.close()
+            shutil.rmtree(download_directory, ignore_errors=True)
+        raise RuntimeError(f"GitHub ответил {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        shutil.rmtree(download_directory, ignore_errors=True)
+        raise RuntimeError(f"Не удалось скачать обновление: {exc}") from exc
+    except Exception:
+        shutil.rmtree(download_directory, ignore_errors=True)
+        raise
+
+
+def stage_update_executable(download_path: Path, target_path: Path) -> Path:
+    if os.name != "nt":
+        raise RuntimeError("Автоматическая установка обновлений доступна только в Windows")
+    target_path = target_path.resolve()
+    if target_path.suffix.casefold() != ".exe" or not target_path.is_file():
+        raise RuntimeError("Не удалось определить EXE-файл SaveSync для обновления")
+    if not download_path.is_file():
+        raise RuntimeError("Скачанный EXE не найден")
+    descriptor, staged_name = tempfile.mkstemp(
+        prefix=".SaveSync-update-",
+        suffix=".exe",
+        dir=target_path.parent,
+    )
+    os.close(descriptor)
+    staged_path = Path(staged_name)
+    try:
+        shutil.copyfile(download_path, staged_path)
+    except OSError:
+        staged_path.unlink(missing_ok=True)
+        raise
+    return staged_path
+
+
+def start_windows_updater(
+    staged_path: Path,
+    target_path: Path,
+    download_directory: Path,
+    process_id: int,
+) -> subprocess.Popen:
+    if os.name != "nt":
+        raise RuntimeError("Автоматическая установка обновлений доступна только в Windows")
+    target_path = target_path.resolve()
+    staged_path = staged_path.resolve()
+    if staged_path.parent != target_path.parent:
+        raise ValueError("Временная копия EXE должна быть рядом с приложением")
+    script_path = download_directory / "install-update.ps1"
+    script = r"""
+param(
+    [int]$WaitForProcess,
+    [string]$StagedFile,
+    [string]$TargetFile,
+    [string]$CleanupDirectory,
+    [string]$ScriptFile
+)
+$ErrorActionPreference = 'Stop'
+$backupFile = "$TargetFile.previous"
+try {
+    $deadline = (Get-Date).AddMinutes(5)
+    while (Get-Process -Id $WaitForProcess -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -ge $deadline) {
+            throw 'SaveSync did not exit in time.'
+        }
+        Start-Sleep -Milliseconds 400
+    }
+
+    if (Test-Path -LiteralPath $backupFile) {
+        Remove-Item -LiteralPath $backupFile -Force -ErrorAction SilentlyContinue
+    }
+    Move-Item -LiteralPath $TargetFile -Destination $backupFile -Force
+    try {
+        Move-Item -LiteralPath $StagedFile -Destination $TargetFile -Force
+        $newProcess = Start-Process -FilePath $TargetFile -PassThru
+        Start-Sleep -Seconds 3
+        $newProcess.Refresh()
+        if ($newProcess.HasExited) {
+            throw 'Updated SaveSync did not start successfully.'
+        }
+        Remove-Item -LiteralPath $backupFile -Force -ErrorAction SilentlyContinue
+    } catch {
+        if (Test-Path -LiteralPath $TargetFile) {
+            Remove-Item -LiteralPath $TargetFile -Force
+        }
+        if (Test-Path -LiteralPath $backupFile) {
+            Move-Item -LiteralPath $backupFile -Destination $TargetFile -Force
+            Start-Process -FilePath $TargetFile
+        }
+        throw
+    }
+} catch {
+    $logFile = Join-Path $env:TEMP (
+        'savesync-update-' + [guid]::NewGuid().ToString('N') + '.log'
+    )
+    $_ | Out-String | Set-Content -LiteralPath $logFile -Encoding UTF8
+    Start-Process -FilePath 'notepad.exe' -ArgumentList $logFile
+} finally {
+    if (Test-Path -LiteralPath $StagedFile) {
+        Remove-Item -LiteralPath $StagedFile -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $CleanupDirectory) {
+        Remove-Item -LiteralPath $CleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $ScriptFile) {
+        Remove-Item -LiteralPath $ScriptFile -Force -ErrorAction SilentlyContinue
+    }
+}
+"""
+    script_path.write_text(script, encoding="utf-8")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+        subprocess, "DETACHED_PROCESS", 0
+    )
+    try:
+        return subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(script_path),
+                "-WaitForProcess",
+                str(process_id),
+                "-StagedFile",
+                str(staged_path),
+                "-TargetFile",
+                str(target_path),
+                "-CleanupDirectory",
+                str(download_directory),
+                "-ScriptFile",
+                str(script_path),
+            ],
+            creationflags=flags,
+            close_fds=True,
+        )
+    except OSError:
+        script_path.unlink(missing_ok=True)
+        raise
 
 
 def custom_game_profiles(settings: object) -> tuple[GameProfile, ...]:
@@ -791,6 +1112,7 @@ class SaveSyncWindow:
         self._auto_upload_pending: dict[str, Path] = {}
         self._auto_upload_last_at: dict[str, float] = {}
         self._auto_upload_timers: dict[str, threading.Timer] = {}
+        self._update_in_progress = False
         self.values = {
             "mode": tk.StringVar(value="client"),
             "server": tk.StringVar(value="http://127.0.0.1:8000"),
@@ -1339,9 +1661,11 @@ class SaveSyncWindow:
         connection_page = ttk.Frame(notebook, padding=6)
         saves_page = ttk.Frame(notebook, padding=6)
         games_page = ttk.Frame(notebook, padding=6)
+        github_page = ttk.Frame(notebook, padding=12)
         notebook.add(connection_page, text="Подключение")
         notebook.add(saves_page, text="Сейвы")
         notebook.add(games_page, text="Свои игры")
+        notebook.add(github_page, text="GitHub")
 
         for column in range(2):
             connection_page.columnconfigure(
@@ -1588,6 +1912,71 @@ class SaveSyncWindow:
             command=self._remove_custom_game,
         ).pack(side="left", padx=8)
         self._refresh_custom_game_table()
+
+        github_page.columnconfigure(0, weight=1)
+        github_card = ttk.LabelFrame(
+            github_page,
+            text="SaveSync на GitHub",
+            padding=12,
+        )
+        github_card.grid(row=0, column=0, sticky="new", padx=4, pady=4)
+        github_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            github_card,
+            text="Исходный код, выпуски и сообщения об ошибках проекта.",
+            wraplength=680,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        github_links = ttk.Frame(github_card)
+        github_links.grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Button(
+            github_links,
+            text="Открыть репозиторий",
+            command=lambda: self._open_github_page(GITHUB_REPOSITORY_URL),
+        ).pack(side="left")
+        ttk.Button(
+            github_links,
+            text="Открыть выпуски",
+            command=lambda: self._open_github_page(GITHUB_RELEASES_URL),
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            github_card,
+            text=f"Установленная версия: {APP_VERSION}",
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        self.github_status = tk.StringVar(
+            value="Проверка ищет опубликованные тестовые и стабильные версии."
+        )
+        ttk.Label(
+            github_card,
+            textvariable=self.github_status,
+            wraplength=680,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.github_progress = ttk.Progressbar(
+            github_card,
+            mode="determinate",
+            maximum=100,
+            length=340,
+        )
+        self.github_progress.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        self.github_progress.grid_remove()
+        self.github_check_button = ttk.Button(
+            github_card,
+            text="Проверить и установить обновление",
+            command=self._check_for_updates,
+            style="Primary.TButton",
+            state="disabled" if self._update_in_progress else "normal",
+        )
+        self.github_check_button.grid(row=5, column=0, sticky="w")
+        ttk.Label(
+            github_page,
+            text="EXE скачивается только из официального релиза SaveSync и "
+            "проверяется по SHA-256 перед заменой. Для установки приложение "
+            "перезапустится. Запущенный из Python исходный код можно обновить "
+            "только вручную.",
+            wraplength=720,
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", padx=6, pady=(8, 0))
+
         footer = ttk.Frame(window, padding=(12, 6, 12, 12))
         footer.grid(row=1, column=0, sticky="ew")
         ttk.Button(
@@ -1595,6 +1984,114 @@ class SaveSyncWindow:
             text="Сохранить настройки",
             command=self._save_settings_from_window,
         ).pack(side="right")
+
+    def _open_github_page(self, url: str) -> None:
+        try:
+            if not webbrowser.open(url):
+                raise RuntimeError("Не удалось открыть браузер")
+        except Exception as exc:
+            messagebox.showerror(
+                "GitHub",
+                f"Не удалось открыть страницу GitHub: {exc}",
+                parent=self.settings_window or self.root,
+            )
+
+    def _check_for_updates(self) -> None:
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
+        self.github_check_button.configure(state="disabled")
+        self.github_status.set("Проверяю новые выпуски SaveSync на GitHub…")
+        self.github_progress.grid_remove()
+
+        def check() -> None:
+            try:
+                release = check_github_update()
+                if release is None:
+                    self.events.put(("update-current", APP_VERSION))
+                    return
+                version = str(release["tag_name"])
+                if not getattr(sys, "frozen", False) or os.name != "nt":
+                    release_url = (
+                        f"{GITHUB_REPOSITORY_URL}/releases/tag/"
+                        f"{urllib.parse.quote(version, safe='')}"
+                    )
+                    self.events.put(("update-manual", (version, release_url)))
+                    return
+                self.events.put(("update-downloading", version))
+                download_path, download_directory = download_update_executable(
+                    release,
+                    lambda received, total: self.events.put(
+                        ("update-progress", (received, total))
+                    ),
+                )
+                self.events.put(
+                    (
+                        "update-ready",
+                        (release, download_path, download_directory),
+                    )
+                )
+            except Exception as exc:
+                self.events.put(("update-error", str(exc)))
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _reset_update_controls(self, status: str) -> None:
+        self._update_in_progress = False
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.github_check_button.configure(state="normal")
+            self.github_progress.stop()
+            self.github_progress.grid_remove()
+            self.github_status.set(status)
+
+    def _install_downloaded_update(
+        self,
+        release: dict[str, object],
+        download_path: Path,
+        download_directory: Path,
+    ) -> None:
+        version = str(release["tag_name"])
+        confirmed = messagebox.askyesno(
+            "Установить обновление",
+            f"Найдена версия {version}. Установить её и перезапустить SaveSync?",
+            parent=self.settings_window or self.root,
+        )
+        if not confirmed:
+            shutil.rmtree(download_directory, ignore_errors=True)
+            self._reset_update_controls("Установка отменена.")
+            return
+
+        staged_path: Path | None = None
+        updater: subprocess.Popen | None = None
+        try:
+            target_path = Path(sys.executable).resolve()
+            staged_path = stage_update_executable(download_path, target_path)
+            updater = start_windows_updater(
+                staged_path,
+                target_path,
+                download_directory,
+                os.getpid(),
+            )
+            self._close()
+            if self.root.winfo_exists():
+                updater.terminate()
+                staged_path.unlink(missing_ok=True)
+                shutil.rmtree(download_directory, ignore_errors=True)
+                self._reset_update_controls(
+                    "Не удалось закрыть сервер. Обновление не установлено."
+                )
+        except Exception as exc:
+            if updater is not None and updater.poll() is None:
+                updater.terminate()
+            if staged_path is not None:
+                staged_path.unlink(missing_ok=True)
+            shutil.rmtree(download_directory, ignore_errors=True)
+            self._reset_update_controls(f"Не удалось установить обновление: {exc}")
+            messagebox.showerror(
+                "Обновление",
+                f"Не удалось подготовить установку: {exc}",
+                parent=self.settings_window or self.root,
+            )
 
     def _close_settings(self) -> None:
         if self.settings_window is not None:
@@ -2439,6 +2936,65 @@ class SaveSyncWindow:
                         )
                 elif event == "room-error":
                     self.settings_status.set(f"Ошибка комнаты: {payload}")
+                elif event == "update-current":
+                    self._reset_update_controls(
+                        f"Установлена последняя версия: {payload}."
+                    )
+                elif event == "update-downloading":
+                    if self.settings_window is not None and self.settings_window.winfo_exists():
+                        self.github_status.set(
+                            f"Найдена версия {payload}. Скачиваю и проверяю EXE…"
+                        )
+                        self.github_progress.configure(
+                            mode="determinate",
+                            maximum=100,
+                            value=0,
+                        )
+                        self.github_progress.grid()
+                elif event == "update-progress":
+                    received, total = payload
+                    if self.settings_window is not None and self.settings_window.winfo_exists():
+                        self.github_progress.configure(
+                            mode="determinate",
+                            maximum=total,
+                            value=received,
+                        )
+                        percent = received * 100 // total
+                        received_mb = received / (1024 * 1024)
+                        total_mb = total / (1024 * 1024)
+                        self.github_status.set(
+                            f"Скачиваю обновление: {percent}% "
+                            f"({received_mb:.1f}/{total_mb:.1f} МБ)"
+                        )
+                elif event == "update-manual":
+                    version, url = payload
+                    should_open = messagebox.askyesno(
+                        "Доступно обновление",
+                        f"Найдена версия {version}. Автоустановка доступна "
+                        "только для собранного Windows EXE. Открыть страницу релиза?",
+                        parent=self.settings_window or self.root,
+                    )
+                    if should_open:
+                        self._open_github_page(url)
+                    self._reset_update_controls(
+                        f"Доступна версия {version}; установите её со страницы релиза."
+                    )
+                elif event == "update-ready":
+                    release, download_path, download_directory = payload
+                    self._install_downloaded_update(
+                        release,
+                        download_path,
+                        download_directory,
+                    )
+                elif event == "update-error":
+                    self._reset_update_controls(
+                        f"Проверка обновлений не удалась: {payload}"
+                    )
+                    messagebox.showerror(
+                        "Проверка обновлений",
+                        str(payload),
+                        parent=self.settings_window or self.root,
+                    )
                 elif event == "local-sync":
                     if payload:
                         self.status.set(

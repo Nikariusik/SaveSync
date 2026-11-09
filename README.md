@@ -37,7 +37,8 @@ Select
 to run the API server directly on this PC. In host mode, choose **Настройки…**
 to set the save-storage folder, listening port, and whether other clients may
 upload saves, then press **Запустить сервер**.
-Settings are grouped into **Подключение**, **Сейвы**, and **Свои игры** tabs.
+Settings are grouped into **Подключение**, **Сейвы**, **Свои игры**, and
+**GitHub** tabs.
 The embedded server listens on all network interfaces. SaveSync shows its LAN
 address and port; allow that TCP port through Windows Firewall if prompted.
 To connect people outside the LAN, configure Porthole to forward the shown
@@ -77,10 +78,17 @@ archives expanding beyond 10 GiB.
 
 ### Pre-release Windows executable
 
-The current very early alpha/beta test build is available on the GitHub
+The very early `v0.1.0-alpha.2` test build is available on the GitHub
 [Releases page](https://github.com/Nikariusik/SaveSync/releases). It may contain
 bugs or lose data; keep separate backups of important worlds and saves. Please
 report issues with steps to reproduce them.
+
+The **GitHub** settings tab links to the repository and release notes. Its
+update button checks newer published stable or prerelease versions. On the
+packaged Windows EXE, it downloads the matching release asset, verifies the
+GitHub-provided SHA-256 digest, and asks before replacing and restarting the
+application. Running from Python only opens the release page for manual
+installation. Automatic installation may fail if the EXE folder is read-only.
 
 ### Build a single Windows executable
 

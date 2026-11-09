@@ -1,3 +1,6 @@
+import hashlib
+import io
+import shutil
 import threading
 import tempfile
 import unittest
@@ -5,6 +8,7 @@ import socket
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 import client
 from client import (
     ALL_GAMES,
@@ -22,12 +26,141 @@ from client import (
     local_snapshot_path,
     minecraft_world_directories,
     minecraft_world_name,
+    newest_update_release,
     open_url,
+    parse_release_version,
+    release_executable_asset,
+    download_update_executable,
     save_remote_saves_locally,
     safe_extract,
     safe_game_folder_name,
 )
 from watchdog.events import FileModifiedEvent
+
+
+class GithubUpdateTests(unittest.TestCase):
+    def test_release_versions_order_prereleases_and_stable(self):
+        self.assertLess(
+            parse_release_version("v0.2.0-alpha.2"),
+            parse_release_version("v0.2.0-beta.1"),
+        )
+        self.assertLess(
+            parse_release_version("v0.2.0-rc.1"),
+            parse_release_version("v0.2.0"),
+        )
+        self.assertIsNone(parse_release_version("latest"))
+
+    def test_selects_newest_release_newer_than_installed(self):
+        releases = [
+            {"tag_name": "v0.2.0-alpha.1", "draft": False},
+            {"tag_name": "v0.1.0-alpha.1", "draft": False},
+            {"tag_name": "v1.0.0", "draft": True},
+            {"tag_name": "not-a-version", "draft": False},
+        ]
+
+        self.assertEqual(
+            newest_update_release(releases, "0.1.0-alpha.1"),
+            releases[0],
+        )
+        self.assertIsNone(
+            newest_update_release(releases[1:], "0.1.0-alpha.1")
+        )
+
+    def test_release_asset_requires_official_url_and_sha256(self):
+        asset = {
+            "name": "SaveSync-0.2.0-alpha.1.exe",
+            "browser_download_url": (
+                "https://github.com/Nikariusik/SaveSync/releases/download/"
+                "v0.2.0-alpha.1/SaveSync-0.2.0-alpha.1.exe"
+            ),
+            "digest": "sha256:" + "a" * 64,
+            "size": 20,
+        }
+        release = {
+            "tag_name": "v0.2.0-alpha.1",
+            "assets": [asset],
+        }
+        self.assertEqual(
+            release_executable_asset(release),
+            (asset["browser_download_url"], "a" * 64, 20),
+        )
+
+        asset["browser_download_url"] = "https://example.com/SaveSync.exe"
+        with self.assertRaisesRegex(ValueError, "официальный"):
+            release_executable_asset(release)
+
+    def test_download_checks_size_and_digest(self):
+        payload = b"SaveSync test executable"
+        digest = hashlib.sha256(payload).hexdigest()
+        release = {
+            "tag_name": "v0.2.0",
+            "assets": [
+                {
+                    "name": "SaveSync-v0.2.0.exe",
+                    "browser_download_url": (
+                        "https://github.com/Nikariusik/SaveSync/releases/download/"
+                        "v0.2.0/SaveSync-v0.2.0.exe"
+                    ),
+                    "digest": f"sha256:{digest}",
+                    "size": len(payload),
+                }
+            ],
+        }
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Length": str(len(payload))}
+
+            def geturl(self):
+                return (
+                    "https://release-assets.githubusercontent.com/download/"
+                    "SaveSync-v0.2.0.exe"
+                )
+
+        progress = []
+        with patch("client.open_url", return_value=FakeResponse(payload)):
+            path, directory = download_update_executable(
+                release,
+                lambda received, total: progress.append((received, total)),
+            )
+        try:
+            self.assertEqual(path.read_bytes(), payload)
+            self.assertEqual(progress, [(len(payload), len(payload))])
+        finally:
+            shutil.rmtree(directory)
+
+    def test_download_rejects_digest_mismatch_and_cleans_temp_files(self):
+        payload = b"not the published executable"
+        release = {
+            "tag_name": "v0.2.0",
+            "assets": [
+                {
+                    "name": "SaveSync-v0.2.0.exe",
+                    "browser_download_url": (
+                        "https://github.com/Nikariusik/SaveSync/releases/download/"
+                        "v0.2.0/SaveSync-v0.2.0.exe"
+                    ),
+                    "digest": "sha256:" + "0" * 64,
+                    "size": len(payload),
+                }
+            ],
+        }
+
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Length": str(len(payload))}
+
+            def geturl(self):
+                return "https://release-assets.githubusercontent.com/file.exe"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            download_directory = Path(temporary) / "download"
+            download_directory.mkdir()
+            with (
+                patch("client.tempfile.mkdtemp", return_value=str(download_directory)),
+                patch("client.open_url", return_value=FakeResponse(payload)),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+                    download_update_executable(release)
+            self.assertFalse(download_directory.exists())
 
 
 class ArchiveTests(unittest.TestCase):
